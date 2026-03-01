@@ -1,0 +1,9 @@
+# IDE
+.idea/
+
+# Runtime artifacts
+backup/
+
+# OS
+.DS_Store
+Thumbs.db
