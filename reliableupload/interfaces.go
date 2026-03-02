@@ -41,14 +41,14 @@ type UploadLogRepo interface {
 	GetLastTimeEndByCode(ctx context.Context, taskCode string) (time.Time, bool, error)
 }
 
-// DailyTaskRepo provides daily task persistence.
-type DailyTaskRepo interface {
-	GetOrCreateInstance(ctx context.Context, taskCode string, taskDate time.Time) (DailyTaskInstance, error)
+// BigTaskRepo provides big task persistence.
+type BigTaskRepo interface {
+	GetOrCreateInstance(ctx context.Context, taskCode string, windowStart, windowEnd time.Time) (BigTaskInstance, error)
 	UpdateProducedMeta(ctx context.Context, instanceID int64, totalBatches, totalRecords int) error
-	CreateBatch(ctx context.Context, batch DailyTaskBatch) error
-	FindRunningInstances(ctx context.Context) ([]DailyTaskInstance, error)
+	CreateBatch(ctx context.Context, batch BigTaskBatch) error
+	FindRunningInstances(ctx context.Context) ([]BigTaskInstance, error)
 	CountBatches(ctx context.Context, instanceID int64) (int, error)
-	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]DailyTaskBatch, error)
+	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]BigTaskBatch, error)
 	MarkBatchUploaded(ctx context.Context, batchID int64) error
 	IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error
 	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
@@ -61,6 +61,25 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
+// LoggerFuncs adapts plain function callbacks to Logger.
+// Useful for integrating loggers like zap without creating a custom type.
+type LoggerFuncs struct {
+	InfofFunc  func(format string, args ...any)
+	ErrorfFunc func(format string, args ...any)
+}
+
+func (l LoggerFuncs) Infof(format string, args ...any) {
+	if l.InfofFunc != nil {
+		l.InfofFunc(format, args...)
+	}
+}
+
+func (l LoggerFuncs) Errorf(format string, args ...any) {
+	if l.ErrorfFunc != nil {
+		l.ErrorfFunc(format, args...)
+	}
+}
+
 // Clock allows deterministic tests.
 type Clock interface {
 	Now() time.Time
@@ -69,7 +88,7 @@ type Clock interface {
 // FileNamer allows custom file naming strategy.
 type FileNamer interface {
 	MinuteFileName(cfg TaskConfig, start, end time.Time, batchIndex int) string
-	DailyFileName(cfg TaskConfig, date time.Time, batchIndex int) string
+	BigFileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int) string
 }
 
 // Reconciler can optionally detect backup-vs-log drifts and alert.

@@ -2,10 +2,10 @@ package reliableupload
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,7 +17,7 @@ type Engine struct {
 	registry     *Registry
 	cfgRepo      TaskConfigRepo
 	logRepo      UploadLogRepo
-	dailyRepo    DailyTaskRepo
+	bigRepo      BigTaskRepo
 	backup       BackupStore
 	clock        Clock
 	logger       Logger
@@ -30,6 +30,16 @@ type EngineOption func(*Engine)
 
 func WithLogger(logger Logger) EngineOption {
 	return func(e *Engine) { e.logger = logger }
+}
+
+// WithLoggerFuncs allows injecting plain function callbacks as logger.
+func WithLoggerFuncs(infof func(string, ...any), errorf func(string, ...any)) EngineOption {
+	return func(e *Engine) {
+		e.logger = LoggerFuncs{
+			InfofFunc:  infof,
+			ErrorfFunc: errorf,
+		}
+	}
 }
 
 func WithClock(clock Clock) EngineOption {
@@ -48,12 +58,12 @@ func WithPendingLimit(limit int) EngineOption {
 	}
 }
 
-func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo, dailyRepo DailyTaskRepo, backup BackupStore, opts ...EngineOption) *Engine {
+func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo, bigRepo BigTaskRepo, backup BackupStore, opts ...EngineOption) *Engine {
 	e := &Engine{
 		registry:     registry,
 		cfgRepo:      cfgRepo,
 		logRepo:      logRepo,
-		dailyRepo:    dailyRepo,
+		bigRepo:      bigRepo,
 		backup:       backup,
 		clock:        systemClock{},
 		logger:       noopLogger{},
@@ -78,15 +88,62 @@ func (e *Engine) RunProducer(ctx context.Context) error {
 	})
 }
 
-// RunUploader uploads minute pending logs and daily pending batches.
-func (e *Engine) RunUploader(ctx context.Context) error {
-	if err := e.uploadMinute(ctx); err != nil {
+// ProduceForTask produces one explicit time range for the given task_code.
+// This API is useful when developers want full control over trigger timing.
+func (e *Engine) ProduceForTask(ctx context.Context, taskCode string, start, end time.Time) error {
+	cfg, err := e.cfgRepo.Get(ctx, taskCode)
+	if err != nil {
 		return err
 	}
-	return e.uploadDaily(ctx)
+	if !cfg.Enabled {
+		return fmt.Errorf("task=%s is disabled", taskCode)
+	}
+	return e.produceRange(ctx, cfg, start, end)
 }
 
-// OnStartup backfills minute gaps and resumes daily running instances.
+// ProduceCurrentWindowForTask produces only the current minute window for one task.
+func (e *Engine) ProduceCurrentWindowForTask(ctx context.Context, taskCode string) error {
+	cfg, err := e.cfgRepo.Get(ctx, taskCode)
+	if err != nil {
+		return err
+	}
+	if cfg.TaskType != TaskTypeMinute {
+		return fmt.Errorf("task=%s is not minute type", taskCode)
+	}
+	start, end := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds)
+	return e.produceRange(ctx, cfg, start, end)
+}
+
+// RunUploader is a compatibility entrypoint that uploads both:
+// 1) minute pending logs
+// 2) big-task pending batches
+func (e *Engine) RunUploader(ctx context.Context) error {
+	if err := e.RunMinuteUploader(ctx); err != nil {
+		return err
+	}
+	return e.RunBigUploader(ctx)
+}
+
+// RunMinuteUploader uploads minute-task pending logs only.
+func (e *Engine) RunMinuteUploader(ctx context.Context) error {
+	return e.uploadMinute(ctx)
+}
+
+// RunBigUploader uploads big-task pending batches only.
+func (e *Engine) RunBigUploader(ctx context.Context) error {
+	return e.uploadBig(ctx)
+}
+
+// UploadPendingForTask uploads minute pending logs only for one task_code.
+func (e *Engine) UploadPendingForTask(ctx context.Context, taskCode string) error {
+	cfg, err := e.cfgRepo.Get(ctx, taskCode)
+	if err != nil {
+		return err
+	}
+	return e.uploadMinuteByTaskCode(ctx, cfg)
+}
+
+// OnStartup backfills minute gaps and resumes big running instances.
 func (e *Engine) OnStartup(ctx context.Context) error {
 	configs, err := e.cfgRepo.FindEnabledByType(ctx, TaskTypeMinute)
 	if err != nil {
@@ -97,28 +154,28 @@ func (e *Engine) OnStartup(ctx context.Context) error {
 			e.logger.Errorf("recover minute gap failed task=%s err=%v", cfg.TaskCode, err)
 		}
 	}
-	return e.resumeDaily(ctx)
+	return e.resumeBig(ctx)
 }
 
-// RunDailyTask creates/resumes one full-day task and uploads all pending batches.
-func (e *Engine) RunDailyTask(ctx context.Context, taskCode string, taskDate time.Time) error {
+// RunBigTask creates/resumes one custom-window big task and uploads all pending batches.
+func (e *Engine) RunBigTask(ctx context.Context, taskCode string, windowStart, windowEnd time.Time) error {
 	cfg, err := e.cfgRepo.Get(ctx, taskCode)
 	if err != nil {
 		return err
 	}
-	if cfg.TaskType != TaskTypeDaily {
-		return fmt.Errorf("task=%s is not daily", taskCode)
+	if cfg.TaskType != TaskTypeBig {
+		return fmt.Errorf("task=%s is not big task type", taskCode)
 	}
-	inst, err := e.dailyRepo.GetOrCreateInstance(ctx, taskCode, normalizeDate(taskDate))
+	inst, err := e.bigRepo.GetOrCreateInstance(ctx, taskCode, windowStart, windowEnd)
 	if err != nil {
 		return err
 	}
 	if inst.TotalBatches == 0 {
-		if err := e.produceDaily(ctx, cfg, inst); err != nil {
+		if err := e.produceBig(ctx, cfg, inst); err != nil {
 			return err
 		}
 	}
-	return e.uploadPendingBatches(ctx, cfg, inst.ID)
+	return e.uploadPendingBigBatches(ctx, cfg, inst.ID)
 }
 
 func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end time.Time) error {
@@ -138,7 +195,8 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 		return err
 	}
 	for i, chunk := range chunks {
-		fileName := e.namer.MinuteFileName(cfg, start, end, i+1)
+		namer := e.fileNamerForTask(cfg.TaskCode)
+		fileName := namer.MinuteFileName(cfg, start, end, i+1)
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk)
 		if err != nil {
 			return err
@@ -229,25 +287,26 @@ func (e *Engine) recoverMinuteGaps(ctx context.Context, cfg TaskConfig) error {
 	return nil
 }
 
-func (e *Engine) produceDaily(ctx context.Context, cfg TaskConfig, inst DailyTaskInstance) error {
+func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskInstance) error {
 	ds, err := e.registry.DataSource(cfg.TaskCode)
 	if err != nil {
 		return err
 	}
-	start := normalizeDate(inst.TaskDate)
-	end := start.Add(24 * time.Hour)
+	start := inst.WindowStart
+	end := inst.WindowEnd
 	chunks, err := ds.FetchAndEncode(ctx, cfg, start, end)
 	if err != nil {
 		return err
 	}
 	for i, chunk := range chunks {
 		index := i + 1
-		fileName := e.namer.DailyFileName(cfg, start, index)
+		namer := e.fileNamerForTask(cfg.TaskCode)
+		fileName := namer.BigFileName(cfg, start, end, index)
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk)
 		if err != nil {
 			return err
 		}
-		batch := DailyTaskBatch{
+		batch := BigTaskBatch{
 			InstanceID: inst.ID,
 			BatchIndex: index,
 			FileName:   fileName,
@@ -256,93 +315,89 @@ func (e *Engine) produceDaily(ctx context.Context, cfg TaskConfig, inst DailyTas
 			CreatedAt:  e.clock.Now(),
 			UpdatedAt:  e.clock.Now(),
 		}
-		if err := e.dailyRepo.CreateBatch(ctx, batch); err != nil {
+		if err := e.bigRepo.CreateBatch(ctx, batch); err != nil {
 			return err
 		}
 	}
-	return e.dailyRepo.UpdateProducedMeta(ctx, inst.ID, len(chunks), 0)
+	return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, len(chunks), 0)
 }
 
-func (e *Engine) uploadDaily(ctx context.Context) error {
-	instances, err := e.dailyRepo.FindRunningInstances(ctx)
+func (e *Engine) uploadBig(ctx context.Context) error {
+	instances, err := e.bigRepo.FindRunningInstances(ctx)
 	if err != nil {
 		return err
 	}
-	return e.runInParallelInstances(instances, func(inst DailyTaskInstance) error {
+	return e.runInParallelInstances(instances, func(inst BigTaskInstance) error {
 		cfg, err := e.cfgRepo.Get(ctx, inst.TaskCode)
 		if err != nil {
 			return err
 		}
-		return e.uploadPendingBatches(ctx, cfg, inst.ID)
+		return e.uploadPendingBigBatches(ctx, cfg, inst.ID)
 	})
 }
 
-func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, instanceID int64) error {
+func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, instanceID int64) error {
 	rp, err := e.registry.Reporter(cfg.TaskCode)
 	if err != nil {
 		return err
 	}
-	batches, err := e.dailyRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, e.pendingLimit)
+	batches, err := e.bigRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, e.pendingLimit)
 	if err != nil {
 		return err
 	}
 	for _, b := range batches {
 		data, err := e.backup.Read(ctx, b.BackupPath)
 		if err != nil {
-			e.dailyRepo.IncrBatchRetry(ctx, b.ID, err.Error())
+			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
 			return err
 		}
 		err = rp.Upload(ctx, cfg, b.FileName, data)
 		if err != nil {
-			e.dailyRepo.IncrBatchRetry(ctx, b.ID, err.Error())
+			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
 			return err
 		}
-		if err := e.dailyRepo.MarkBatchUploaded(ctx, b.ID); err != nil {
+		if err := e.bigRepo.MarkBatchUploaded(ctx, b.ID); err != nil {
 			return err
 		}
 	}
-	uploaded, err := e.dailyRepo.CountUploadedBatches(ctx, instanceID)
+	uploaded, err := e.bigRepo.CountUploadedBatches(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	total, err := e.dailyRepo.CountBatches(ctx, instanceID)
+	total, err := e.bigRepo.CountBatches(ctx, instanceID)
 	if err != nil {
 		return err
 	}
 	if total > 0 && uploaded >= total {
-		_ = e.dailyRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
+		_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
 	}
 	return nil
 }
 
-func (e *Engine) resumeDaily(ctx context.Context) error {
-	instances, err := e.dailyRepo.FindRunningInstances(ctx)
+func (e *Engine) resumeBig(ctx context.Context) error {
+	instances, err := e.bigRepo.FindRunningInstances(ctx)
 	if err != nil {
 		return err
 	}
-	return e.runInParallelInstances(instances, func(inst DailyTaskInstance) error {
+	return e.runInParallelInstances(instances, func(inst BigTaskInstance) error {
 		cfg, err := e.cfgRepo.Get(ctx, inst.TaskCode)
 		if err != nil {
 			return err
 		}
-		batchCount, err := e.dailyRepo.CountBatches(ctx, inst.ID)
+		batchCount, err := e.bigRepo.CountBatches(ctx, inst.ID)
 		if err != nil {
 			return err
 		}
 		if inst.TotalBatches > 0 && batchCount < inst.TotalBatches {
-			return e.produceDaily(ctx, cfg, inst)
+			return e.produceBig(ctx, cfg, inst)
 		}
-		return e.uploadPendingBatches(ctx, cfg, inst.ID)
+		return e.uploadPendingBigBatches(ctx, cfg, inst.ID)
 	})
 }
 
 func calcMinuteRange(now time.Time, delaySeconds int) (time.Time, time.Time) {
 	t := now.Add(-time.Duration(delaySeconds) * time.Second).Truncate(time.Minute).Add(-time.Minute)
 	return t, t.Add(time.Minute)
-}
-
-func normalizeDate(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 }
 
 func (e *Engine) runInParallel(configs []TaskConfig, fn func(cfg TaskConfig) error) error {
@@ -381,7 +436,7 @@ func (e *Engine) runInParallelTaskCodes(codes []string, fn func(taskCode string)
 	return joinErrors(errCh)
 }
 
-func (e *Engine) runInParallelInstances(instances []DailyTaskInstance, fn func(inst DailyTaskInstance) error) error {
+func (e *Engine) runInParallelInstances(instances []BigTaskInstance, fn func(inst BigTaskInstance) error) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(instances))
 	for _, inst := range instances {
@@ -400,11 +455,17 @@ func (e *Engine) runInParallelInstances(instances []DailyTaskInstance, fn func(i
 }
 
 func joinErrors(errCh <-chan error) error {
-	var all error
+	msgs := make([]string, 0)
 	for err := range errCh {
-		all = errors.Join(all, err)
+		if err == nil {
+			continue
+		}
+		msgs = append(msgs, err.Error())
 	}
-	return all
+	if len(msgs) == 0 {
+		return nil
+	}
+	return fmt.Errorf(strings.Join(msgs, " | "))
 }
 
 type systemClock struct{}
@@ -422,10 +483,17 @@ func (defaultFileNamer) MinuteFileName(cfg TaskConfig, start, end time.Time, bat
 	return fmt.Sprintf("%s_%s_%s_%03d.dat", cfg.FilePrefix, start.Format("20060102150405"), end.Format("20060102150405"), batchIndex)
 }
 
-func (defaultFileNamer) DailyFileName(cfg TaskConfig, date time.Time, batchIndex int) string {
-	return fmt.Sprintf("%s_%s_%03d.dat", cfg.FilePrefix, date.Format("20060102"), batchIndex)
+func (defaultFileNamer) BigFileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int) string {
+	return fmt.Sprintf("%s_%s_%s_%03d.dat", cfg.FilePrefix, windowStart.Format("20060102150405"), windowEnd.Format("20060102150405"), batchIndex)
 }
 
 func BuildRemotePath(cfg TaskConfig, fileName string) string {
 	return path.Join(cfg.SFTPSubdir, fileName)
+}
+
+func (e *Engine) fileNamerForTask(taskCode string) FileNamer {
+	if namer, ok := e.registry.FileNamer(taskCode); ok {
+		return namer
+	}
+	return e.namer
 }

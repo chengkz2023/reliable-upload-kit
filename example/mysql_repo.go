@@ -31,10 +31,11 @@ type uploadLogModel struct {
 
 func (uploadLogModel) TableName() string { return "uploadlog" }
 
-type dailyTaskInstanceModel struct {
+type bigTaskInstanceModel struct {
 	ID              int64      `gorm:"column:id;primaryKey;autoIncrement"`
-	TaskCode        string     `gorm:"column:task_code;type:varchar(64);not null;uniqueIndex:uk_task,priority:1;index:idx_status,priority:1"`
-	TaskDate        time.Time  `gorm:"column:task_date;type:date;not null;uniqueIndex:uk_task,priority:2"`
+	TaskCode        string     `gorm:"column:task_code;type:varchar(64);not null;uniqueIndex:uk_task_window,priority:1;index:idx_status,priority:1"`
+	WindowStart     time.Time  `gorm:"column:window_start;not null;uniqueIndex:uk_task_window,priority:2"`
+	WindowEnd       time.Time  `gorm:"column:window_end;not null;uniqueIndex:uk_task_window,priority:3"`
 	Status          uint8      `gorm:"column:status;not null;default:0;index:idx_status,priority:2"`
 	TotalBatches    int        `gorm:"column:total_batches"`
 	UploadedBatches int        `gorm:"column:uploaded_batches;not null;default:0"`
@@ -43,9 +44,9 @@ type dailyTaskInstanceModel struct {
 	FinishedAt      *time.Time `gorm:"column:finished_at"`
 }
 
-func (dailyTaskInstanceModel) TableName() string { return "daily_task_instance" }
+func (bigTaskInstanceModel) TableName() string { return "big_task_instance" }
 
-type dailyTaskBatchModel struct {
+type bigTaskBatchModel struct {
 	ID         int64     `gorm:"column:id;primaryKey;autoIncrement"`
 	InstanceID int64     `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
 	BatchIndex int       `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
@@ -58,14 +59,13 @@ type dailyTaskBatchModel struct {
 	UpdatedAt  time.Time `gorm:"column:updated_at;autoUpdateTime"`
 }
 
-func (dailyTaskBatchModel) TableName() string { return "daily_task_batch" }
+func (bigTaskBatchModel) TableName() string { return "big_task_batch" }
 
 func openMySQL(dsn string) (*gorm.DB, error) {
 	return gorm.Open(mysql.Open(dsn), &gorm.Config{})
 }
 
 func ensureMySQLDatabase(dsn string) error {
-	// 用 admin DSN 连接 mysql 系统库，确保业务库存在。
 	adminDSN, dbName, err := splitMySQLDSN(dsn)
 	if err != nil {
 		return err
@@ -102,8 +102,7 @@ func splitMySQLDSN(dsn string) (adminDSN, dbName string, err error) {
 }
 
 func initMySQLSchema(db *gorm.DB) error {
-	// 初始化或迁移三张核心状态表。
-	return db.AutoMigrate(&uploadLogModel{}, &dailyTaskInstanceModel{}, &dailyTaskBatchModel{})
+	return db.AutoMigrate(&uploadLogModel{}, &bigTaskInstanceModel{}, &bigTaskBatchModel{})
 }
 
 type mysqlUploadLogRepo struct {
@@ -212,50 +211,49 @@ func (r *mysqlUploadLogRepo) GetLastTimeEndByCode(ctx context.Context, taskCode 
 	return row.TimeEnd, true, nil
 }
 
-type mysqlDailyRepo struct {
+type mysqlBigRepo struct {
 	db *gorm.DB
 }
 
-func newMySQLDailyRepo(db *gorm.DB) *mysqlDailyRepo {
-	return &mysqlDailyRepo{db: db}
+func newMySQLBigRepo(db *gorm.DB) *mysqlBigRepo {
+	return &mysqlBigRepo{db: db}
 }
 
-func (r *mysqlDailyRepo) GetOrCreateInstance(ctx context.Context, taskCode string, taskDate time.Time) (reliableupload.DailyTaskInstance, error) {
-	d := time.Date(taskDate.Year(), taskDate.Month(), taskDate.Day(), 0, 0, 0, 0, taskDate.Location())
-	inst := dailyTaskInstanceModel{
-		TaskCode:  taskCode,
-		TaskDate:  d,
-		Status:    uint8(reliableupload.StatusRunning),
-		StartedAt: time.Now(),
+func (r *mysqlBigRepo) GetOrCreateInstance(ctx context.Context, taskCode string, windowStart, windowEnd time.Time) (reliableupload.BigTaskInstance, error) {
+	inst := bigTaskInstanceModel{
+		TaskCode:    taskCode,
+		WindowStart: windowStart,
+		WindowEnd:   windowEnd,
+		Status:      uint8(reliableupload.StatusRunning),
+		StartedAt:   time.Now(),
 	}
-	// 幂等创建: (task_code, task_date) 已存在则忽略插入。
 	err := r.db.WithContext(ctx).
-		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "task_code"}, {Name: "task_date"}}, DoNothing: true}).
+		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "task_code"}, {Name: "window_start"}, {Name: "window_end"}}, DoNothing: true}).
 		Create(&inst).Error
 	if err != nil {
-		return reliableupload.DailyTaskInstance{}, err
+		return reliableupload.BigTaskInstance{}, err
 	}
 
-	var got dailyTaskInstanceModel
+	var got bigTaskInstanceModel
 	err = r.db.WithContext(ctx).
-		Where("task_code = ? AND task_date = ?", taskCode, d).
+		Where("task_code = ? AND window_start = ? AND window_end = ?", taskCode, windowStart, windowEnd).
 		First(&got).Error
 	if err != nil {
-		return reliableupload.DailyTaskInstance{}, err
+		return reliableupload.BigTaskInstance{}, err
 	}
-	return toDailyInstance(got), nil
+	return toBigInstance(got), nil
 }
 
-func (r *mysqlDailyRepo) UpdateProducedMeta(ctx context.Context, instanceID int64, totalBatches, totalRecords int) error {
+func (r *mysqlBigRepo) UpdateProducedMeta(ctx context.Context, instanceID int64, totalBatches, totalRecords int) error {
 	return r.db.WithContext(ctx).
-		Model(&dailyTaskInstanceModel{}).
+		Model(&bigTaskInstanceModel{}).
 		Where("id = ?", instanceID).
 		Updates(map[string]any{"total_batches": totalBatches, "total_records": totalRecords}).
 		Error
 }
 
-func (r *mysqlDailyRepo) CreateBatch(ctx context.Context, batch reliableupload.DailyTaskBatch) error {
-	m := dailyTaskBatchModel{
+func (r *mysqlBigRepo) CreateBatch(ctx context.Context, batch reliableupload.BigTaskBatch) error {
+	m := bigTaskBatchModel{
 		InstanceID: batch.InstanceID,
 		BatchIndex: batch.BatchIndex,
 		FileName:   batch.FileName,
@@ -269,34 +267,34 @@ func (r *mysqlDailyRepo) CreateBatch(ctx context.Context, batch reliableupload.D
 	return r.db.WithContext(ctx).Create(&m).Error
 }
 
-func (r *mysqlDailyRepo) FindRunningInstances(ctx context.Context) ([]reliableupload.DailyTaskInstance, error) {
-	var rows []dailyTaskInstanceModel
+func (r *mysqlBigRepo) FindRunningInstances(ctx context.Context) ([]reliableupload.BigTaskInstance, error) {
+	var rows []bigTaskInstanceModel
 	err := r.db.WithContext(ctx).
 		Where("status = ?", uint8(reliableupload.StatusRunning)).
 		Find(&rows).Error
 	if err != nil {
 		return nil, err
 	}
-	out := make([]reliableupload.DailyTaskInstance, 0, len(rows))
+	out := make([]reliableupload.BigTaskInstance, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, toDailyInstance(row))
+		out = append(out, toBigInstance(row))
 	}
 	return out, nil
 }
 
-func (r *mysqlDailyRepo) CountBatches(ctx context.Context, instanceID int64) (int, error) {
+func (r *mysqlBigRepo) CountBatches(ctx context.Context, instanceID int64) (int, error) {
 	var cnt int64
 	err := r.db.WithContext(ctx).
-		Model(&dailyTaskBatchModel{}).
+		Model(&bigTaskBatchModel{}).
 		Where("instance_id = ?", instanceID).
 		Count(&cnt).Error
 	return int(cnt), err
 }
 
-func (r *mysqlDailyRepo) FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]reliableupload.DailyTaskBatch, error) {
-	var rows []dailyTaskBatchModel
+func (r *mysqlBigRepo) FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]reliableupload.BigTaskBatch, error) {
+	var rows []bigTaskBatchModel
 	err := r.db.WithContext(ctx).
-		Model(&dailyTaskBatchModel{}).
+		Model(&bigTaskBatchModel{}).
 		Where("instance_id = ? AND status = ? AND retry_count <= ?", instanceID, uint8(reliableupload.StatusPending), maxRetry).
 		Order("batch_index ASC").
 		Limit(limit).
@@ -304,9 +302,9 @@ func (r *mysqlDailyRepo) FindPendingBatches(ctx context.Context, instanceID int6
 	if err != nil {
 		return nil, err
 	}
-	out := make([]reliableupload.DailyTaskBatch, 0, len(rows))
+	out := make([]reliableupload.BigTaskBatch, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, reliableupload.DailyTaskBatch{
+		out = append(out, reliableupload.BigTaskBatch{
 			ID:         row.ID,
 			InstanceID: row.InstanceID,
 			BatchIndex: row.BatchIndex,
@@ -322,38 +320,38 @@ func (r *mysqlDailyRepo) FindPendingBatches(ctx context.Context, instanceID int6
 	return out, nil
 }
 
-func (r *mysqlDailyRepo) MarkBatchUploaded(ctx context.Context, batchID int64) error {
+func (r *mysqlBigRepo) MarkBatchUploaded(ctx context.Context, batchID int64) error {
 	return r.db.WithContext(ctx).
-		Model(&dailyTaskBatchModel{}).
+		Model(&bigTaskBatchModel{}).
 		Where("id = ?", batchID).
 		Updates(map[string]any{"status": uint8(reliableupload.StatusUploaded), "updated_at": time.Now()}).
 		Error
 }
 
-func (r *mysqlDailyRepo) IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error {
+func (r *mysqlBigRepo) IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error {
 	return r.db.WithContext(ctx).
-		Model(&dailyTaskBatchModel{}).
+		Model(&bigTaskBatchModel{}).
 		Where("id = ?", batchID).
 		Updates(map[string]any{"retry_count": gorm.Expr("retry_count + 1"), "err_msg": errMsg, "updated_at": time.Now()}).
 		Error
 }
 
-func (r *mysqlDailyRepo) CountUploadedBatches(ctx context.Context, instanceID int64) (int, error) {
+func (r *mysqlBigRepo) CountUploadedBatches(ctx context.Context, instanceID int64) (int, error) {
 	var cnt int64
 	err := r.db.WithContext(ctx).
-		Model(&dailyTaskBatchModel{}).
+		Model(&bigTaskBatchModel{}).
 		Where("instance_id = ? AND status = ?", instanceID, uint8(reliableupload.StatusUploaded)).
 		Count(&cnt).Error
 	return int(cnt), err
 }
 
-func (r *mysqlDailyRepo) MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error {
+func (r *mysqlBigRepo) MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error {
 	uploaded, err := r.CountUploadedBatches(ctx, instanceID)
 	if err != nil {
 		return err
 	}
 	return r.db.WithContext(ctx).
-		Model(&dailyTaskInstanceModel{}).
+		Model(&bigTaskInstanceModel{}).
 		Where("id = ?", instanceID).
 		Updates(map[string]any{
 			"status":           uint8(reliableupload.StatusUploaded),
@@ -362,11 +360,12 @@ func (r *mysqlDailyRepo) MarkInstanceCompleted(ctx context.Context, instanceID i
 		}).Error
 }
 
-func toDailyInstance(m dailyTaskInstanceModel) reliableupload.DailyTaskInstance {
-	return reliableupload.DailyTaskInstance{
+func toBigInstance(m bigTaskInstanceModel) reliableupload.BigTaskInstance {
+	return reliableupload.BigTaskInstance{
 		ID:              m.ID,
 		TaskCode:        m.TaskCode,
-		TaskDate:        m.TaskDate,
+		WindowStart:     m.WindowStart,
+		WindowEnd:       m.WindowEnd,
 		Status:          reliableupload.Status(m.Status),
 		TotalBatches:    m.TotalBatches,
 		UploadedBatches: m.UploadedBatches,

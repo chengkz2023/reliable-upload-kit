@@ -7,7 +7,7 @@ type TaskType uint8
 
 const (
 	TaskTypeMinute TaskType = 1
-	TaskTypeDaily  TaskType = 2
+	TaskTypeBig    TaskType = 2
 )
 
 // Status tracks upload progress.
@@ -17,7 +17,7 @@ const (
 	StatusPending  Status = 0
 	StatusUploaded Status = 1
 	StatusFailed   Status = 2
-	StatusRunning  Status = 3 // daily instance only
+	StatusRunning  Status = 3 // big task instance only
 )
 
 // TaskConfig is runtime configuration loaded from repository.
@@ -47,11 +47,12 @@ type UploadLog struct {
 	UpdatedAt  time.Time
 }
 
-// DailyTaskInstance tracks one (task_code, date) run.
-type DailyTaskInstance struct {
+// BigTaskInstance tracks one (task_code, window_start, window_end) run.
+type BigTaskInstance struct {
 	ID              int64
 	TaskCode        string
-	TaskDate        time.Time
+	WindowStart     time.Time
+	WindowEnd       time.Time
 	Status          Status
 	TotalBatches    int
 	UploadedBatches int
@@ -60,8 +61,8 @@ type DailyTaskInstance struct {
 	FinishedAt      *time.Time
 }
 
-// DailyTaskBatch tracks one file batch for a daily instance.
-type DailyTaskBatch struct {
+// BigTaskBatch tracks one file batch for a big task instance.
+type BigTaskBatch struct {
 	ID         int64
 	InstanceID int64
 	BatchIndex int

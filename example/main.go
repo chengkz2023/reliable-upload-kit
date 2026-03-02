@@ -28,7 +28,7 @@ func main() {
 	if err != nil {
 		panic(fmt.Sprintf("open mysql failed: %v", err))
 	}
-	// 2) 自动建表/补字段（uploadlog + daily_task_instance + daily_task_batch）。
+	// 2) 自动建表/补字段（uploadlog + big_task_instance + big_task_batch）。
 	if err := initMySQLSchema(db); err != nil {
 		panic(fmt.Sprintf("init mysql schema failed: %v", err))
 	}
@@ -45,8 +45,10 @@ func main() {
 
 	registry.RegisterDataSource("order_minute", ds)
 	registry.RegisterReporter("order_minute", rp)
-	registry.RegisterDataSource("order_daily", ds)
-	registry.RegisterReporter("order_daily", rp)
+	registry.RegisterDataSource("order_big", ds)
+	registry.RegisterReporter("order_big", rp)
+	// 可选特性: 为特定 task_code 定制文件名规则。
+	// registry.RegisterFileNamer("order_minute", myMinuteNamer{})
 
 	cfgRepo := &memConfigRepo{m: map[string]reliableupload.TaskConfig{
 		"order_minute": {
@@ -59,26 +61,31 @@ func main() {
 			FilePrefix:   "order",
 			Enabled:      true,
 		},
-		"order_daily": {
-			TaskCode:   "order_daily",
-			TaskType:   reliableupload.TaskTypeDaily,
+		"order_big": {
+			TaskCode:   "order_big",
+			TaskType:   reliableupload.TaskTypeBig,
 			BatchSize:  2000,
 			MaxRetry:   3,
 			SFTPSubdir: "/remote/order",
-			FilePrefix: "order_daily",
+			FilePrefix: "order_big",
 			Enabled:    true,
 		},
 	}}
 
 	// 4) 引擎初始化:
 	// TaskConfigRepo 继续使用内存实现；
-	// UploadLogRepo / DailyTaskRepo 使用 MySQL + GORM 实现。
+	// UploadLogRepo / BigTaskRepo 使用 MySQL + GORM 实现。
 	engine := reliableupload.NewEngine(
 		registry,
 		cfgRepo,
 		newMySQLUploadLogRepo(db),
-		newMySQLDailyRepo(db),
+		newMySQLBigRepo(db),
 		reliableupload.NewFSBackupStore("./backup"),
+		// 可选特性: 使用函数方式注入日志，方便接入 zap 等日志框架。
+		// reliableupload.WithLoggerFuncs(
+		// 	func(format string, args ...any) { zap.L().Sugar().Infof(format, args...) },
+		// 	func(format string, args ...any) { zap.L().Sugar().Errorf(format, args...) },
+		// ),
 		// 可选特性: 控制单轮扫描 pending 的上限，避免一次处理过多。
 		// reliableupload.WithPendingLimit(500),
 		// 可选特性: 注入自定义日志器，接入你现有日志系统。
@@ -91,11 +98,21 @@ func main() {
 
 	// 5) 关键流程演示:
 	// RunProducer: 生产分钟任务（查数 -> 备份 -> 写 pending）
-	// RunUploader: 扫描 pending 并上报（分钟 + 每日 running）
-	// RunDailyTask: 触发/恢复指定日期的每日任务
+	// RunUploader: 兼容入口，扫描 pending 并上报（分钟 + 自定义大任务 running）
+	// 也可独立调用:
+	// _ = engine.RunMinuteUploader(ctx)
+	// _ = engine.RunBigUploader(ctx)
+	// RunBigTask: 触发/恢复指定时间窗口的大任务
 	_ = engine.RunProducer(ctx)
 	_ = engine.RunUploader(ctx)
-	_ = engine.RunDailyTask(ctx, "order_daily", time.Now().AddDate(0, 0, -1))
+	bigStart := time.Now().Add(-time.Hour).Truncate(time.Hour)
+	bigEnd := bigStart.Add(time.Hour)
+	_ = engine.RunBigTask(ctx, "order_big", bigStart, bigEnd)
+
+	// 可选特性: 开发者按 task_code 自由触发，不强依赖框架内置扫描调度。
+	// _ = engine.ProduceCurrentWindowForTask(ctx, "order_minute")
+	// _ = engine.ProduceForTask(ctx, "order_minute", time.Now().Add(-10*time.Minute), time.Now().Add(-9*time.Minute))
+	// _ = engine.UploadPendingForTask(ctx, "order_minute")
 
 	// 可选特性: 服务启动后执行恢复（补分钟空窗 + 续传每日任务）。
 	// _ = engine.OnStartup(ctx)
@@ -134,7 +151,7 @@ func (d *demoDataSource) FetchAndEncode(_ context.Context, cfg reliableupload.Ta
 	// - 分钟任务: 1 个分片
 	// - 每日任务: 2 个分片
 	// 实际业务中请在这里实现: 数据查询 -> 加密/编码 -> 按 batch_size 切片。
-	if cfg.TaskType == reliableupload.TaskTypeDaily {
+	if cfg.TaskType == reliableupload.TaskTypeBig {
 		return [][]byte{
 			[]byte(fmt.Sprintf("%s chunk-1 %s", cfg.TaskCode, start.Format("2006-01-02"))),
 			[]byte(fmt.Sprintf("%s chunk-2 %s", cfg.TaskCode, start.Format("2006-01-02"))),
