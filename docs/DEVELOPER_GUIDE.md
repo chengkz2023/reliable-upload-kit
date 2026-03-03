@@ -19,12 +19,19 @@ type DataSource interface {
     FetchAndEncode(ctx context.Context, cfg TaskConfig, start, end time.Time) ([][]byte, error)
 }
 
+// 可选：大任务窗口很大时建议实现，避免一次性拉全量
+type BigDataSource interface {
+    CountBatches(ctx context.Context, cfg TaskConfig, start, end time.Time) (int, error)
+    FetchAndEncodeBatch(ctx context.Context, cfg TaskConfig, start, end time.Time, batchIndex int) ([]byte, error)
+}
+
 type Reporter interface {
     Upload(ctx context.Context, cfg TaskConfig, fileName string, data []byte) error
 }
 ```
 
 - `DataSource` 负责查数/编码/分批
+- `BigDataSource`（可选）用于大任务先算总批数，再按批获取数据
 - `Reporter` 负责对端上报并保证幂等
 
 ## 3. 引擎能力

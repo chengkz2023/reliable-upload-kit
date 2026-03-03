@@ -294,26 +294,67 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 	}
 	start := inst.WindowStart
 	end := inst.WindowEnd
+	existingCount, err := e.bigRepo.CountBatches(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	if pagedDS, ok := ds.(BigDataSource); ok {
+		totalBatches, err := pagedDS.CountBatches(ctx, cfg, start, end)
+		if err != nil {
+			return err
+		}
+		if totalBatches < 0 {
+			return fmt.Errorf("task=%s invalid total batches: %d", cfg.TaskCode, totalBatches)
+		}
+		for index := existingCount + 1; index <= totalBatches; index++ {
+			chunk, err := pagedDS.FetchAndEncodeBatch(ctx, cfg, start, end, index)
+			if err != nil {
+				return err
+			}
+			namer := e.fileNamerForTask(cfg.TaskCode)
+			fileName := namer.BigFileName(cfg, start, end, index)
+			backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk)
+			if err != nil {
+				return err
+			}
+			now := e.clock.Now()
+			batch := BigTaskBatch{
+				InstanceID: inst.ID,
+				BatchIndex: index,
+				FileName:   fileName,
+				BackupPath: backupPath,
+				Status:     StatusPending,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			if err := e.bigRepo.CreateBatch(ctx, batch); err != nil {
+				return err
+			}
+		}
+		return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, totalBatches, 0)
+	}
+
 	chunks, err := ds.FetchAndEncode(ctx, cfg, start, end)
 	if err != nil {
 		return err
 	}
-	for i, chunk := range chunks {
-		index := i + 1
+	for index := existingCount + 1; index <= len(chunks); index++ {
+		chunk := chunks[index-1]
 		namer := e.fileNamerForTask(cfg.TaskCode)
 		fileName := namer.BigFileName(cfg, start, end, index)
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk)
 		if err != nil {
 			return err
 		}
+		now := e.clock.Now()
 		batch := BigTaskBatch{
 			InstanceID: inst.ID,
 			BatchIndex: index,
 			FileName:   fileName,
 			BackupPath: backupPath,
 			Status:     StatusPending,
-			CreatedAt:  e.clock.Now(),
-			UpdatedAt:  e.clock.Now(),
+			CreatedAt:  now,
+			UpdatedAt:  now,
 		}
 		if err := e.bigRepo.CreateBatch(ctx, batch); err != nil {
 			return err
@@ -368,7 +409,11 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 	if err != nil {
 		return err
 	}
-	if total > 0 && uploaded >= total {
+	if total == 0 {
+		_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
+		return nil
+	}
+	if uploaded >= total {
 		_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
 	}
 	return nil

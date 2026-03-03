@@ -42,6 +42,12 @@ type DataSource interface {
     FetchAndEncode(ctx context.Context, cfg TaskConfig, start, end time.Time) ([][]byte, error)
 }
 
+// 可选：大任务超大窗口时建议实现
+type BigDataSource interface {
+    CountBatches(ctx context.Context, cfg TaskConfig, start, end time.Time) (int, error)
+    FetchAndEncodeBatch(ctx context.Context, cfg TaskConfig, start, end time.Time, batchIndex int) ([]byte, error)
+}
+
 type Reporter interface {
     Upload(ctx context.Context, cfg TaskConfig, fileName string, data []byte) error
 }

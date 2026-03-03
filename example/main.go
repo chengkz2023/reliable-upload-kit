@@ -160,6 +160,17 @@ func (d *demoDataSource) FetchAndEncode(_ context.Context, cfg reliableupload.Ta
 	return [][]byte{[]byte(fmt.Sprintf("%s %s~%s", cfg.TaskCode, start.Format(time.RFC3339), end.Format(time.RFC3339)))}, nil
 }
 
+func (d *demoDataSource) CountBatches(_ context.Context, cfg reliableupload.TaskConfig, _ time.Time, _ time.Time) (int, error) {
+	if cfg.TaskType == reliableupload.TaskTypeBig {
+		return 2, nil
+	}
+	return 1, nil
+}
+
+func (d *demoDataSource) FetchAndEncodeBatch(_ context.Context, cfg reliableupload.TaskConfig, start, _ time.Time, batchIndex int) ([]byte, error) {
+	return []byte(fmt.Sprintf("%s chunk-%d %s", cfg.TaskCode, batchIndex, start.Format("2006-01-02"))), nil
+}
+
 type demoReporter struct {
 	mu       sync.Mutex
 	uploaded map[string]struct{}

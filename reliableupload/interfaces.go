@@ -12,6 +12,14 @@ type DataSource interface {
 	FetchAndEncode(ctx context.Context, cfg TaskConfig, start, end time.Time) ([][]byte, error)
 }
 
+// BigDataSource is optional and used only for large-window big tasks.
+// It allows the engine to avoid loading all data into memory at once.
+// Engine will prefer this interface for TaskTypeBig when implemented.
+type BigDataSource interface {
+	CountBatches(ctx context.Context, cfg TaskConfig, start, end time.Time) (int, error)
+	FetchAndEncodeBatch(ctx context.Context, cfg TaskConfig, start, end time.Time, batchIndex int) ([]byte, error)
+}
+
 // Reporter is implemented by business teams for idempotent upload.
 // Implementations should treat existing remote files as success.
 type Reporter interface {
