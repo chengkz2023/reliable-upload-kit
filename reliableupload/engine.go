@@ -194,6 +194,22 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 	if err != nil {
 		return err
 	}
+	if len(chunks) == 0 {
+		namer := e.fileNamerForTask(cfg.TaskCode)
+		fileName := namer.MinuteFileName(cfg, start, end, 0)
+		now := e.clock.Now()
+		log := UploadLog{
+			TaskCode:   cfg.TaskCode,
+			TimeStart:  start,
+			TimeEnd:    end,
+			FileName:   fileName,
+			Status:     StatusUploaded,
+			BackupPath: "",
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		return e.logRepo.Create(ctx, log)
+	}
 	for i, chunk := range chunks {
 		namer := e.fileNamerForTask(cfg.TaskCode)
 		fileName := namer.MinuteFileName(cfg, start, end, i+1)
