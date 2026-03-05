@@ -322,6 +322,10 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 		if totalBatches < 0 {
 			return fmt.Errorf("task=%s invalid total batches: %d", cfg.TaskCode, totalBatches)
 		}
+		// Persist total batches before producing files so progress denominator is visible immediately.
+		if err := e.bigRepo.UpdateProducedMeta(ctx, inst.ID, totalBatches, 0); err != nil {
+			return err
+		}
 		for index := existingCount + 1; index <= totalBatches; index++ {
 			chunk, err := pagedDS.FetchAndEncodeBatch(ctx, cfg, start, end, index)
 			if err != nil {
@@ -347,11 +351,15 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 				return err
 			}
 		}
-		return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, totalBatches, 0)
+		return nil
 	}
 
 	chunks, err := ds.FetchAndEncode(ctx, cfg, start, end)
 	if err != nil {
+		return err
+	}
+	// For legacy datasource mode, total is known after fetch and is stored before batch persistence.
+	if err := e.bigRepo.UpdateProducedMeta(ctx, inst.ID, len(chunks), 0); err != nil {
 		return err
 	}
 	for index := existingCount + 1; index <= len(chunks); index++ {
@@ -376,7 +384,7 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 			return err
 		}
 	}
-	return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, len(chunks), 0)
+	return nil
 }
 
 func (e *Engine) uploadBig(ctx context.Context) error {
