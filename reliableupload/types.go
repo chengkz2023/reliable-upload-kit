@@ -22,14 +22,17 @@ const (
 
 // TaskConfig is runtime configuration loaded from repository.
 type TaskConfig struct {
-	TaskCode     string
-	TaskType     TaskType
-	DelaySeconds int
-	BatchSize    int
-	MaxRetry     int
-	SFTPSubdir   string
-	FilePrefix   string
-	Enabled      bool
+	TaskCode string
+	TaskType TaskType
+	// IntervalMinutes controls minute-task window size.
+	// Example: 1, 5, 10...
+	IntervalMinutes int
+	DelaySeconds    int
+	BatchSize       int
+	MaxRetry        int
+	SFTPSubdir      string
+	FilePrefix      string
+	Enabled         bool
 }
 
 // Chunk is one upload unit with optional business metadata.

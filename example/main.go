@@ -39,14 +39,15 @@ func main() {
 
 	cfgRepo := &memConfigRepo{m: map[string]reliableupload.TaskConfig{
 		"order_minute": {
-			TaskCode:     "order_minute",
-			TaskType:     reliableupload.TaskTypeMinute,
-			DelaySeconds: 60,
-			BatchSize:    500,
-			MaxRetry:     3,
-			SFTPSubdir:   "/remote/order",
-			FilePrefix:   "order",
-			Enabled:      true,
+			TaskCode:        "order_minute",
+			TaskType:        reliableupload.TaskTypeMinute,
+			IntervalMinutes: 5,
+			DelaySeconds:    60,
+			BatchSize:       500,
+			MaxRetry:        3,
+			SFTPSubdir:      "/remote/order",
+			FilePrefix:      "order",
+			Enabled:         true,
 		},
 		"order_big": {
 			TaskCode:   "order_big",

@@ -81,7 +81,7 @@ func (e *Engine) RunProducer(ctx context.Context) error {
 		return err
 	}
 	return e.runInParallel(configs, func(cfg TaskConfig) error {
-		start, end := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds)
+		start, end := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds, cfg.IntervalMinutes)
 		return e.produceRange(ctx, cfg, start, end)
 	})
 }
@@ -107,7 +107,7 @@ func (e *Engine) ProduceCurrentWindowForTask(ctx context.Context, taskCode strin
 	if cfg.TaskType != TaskTypeMinute {
 		return fmt.Errorf("task=%s is not minute type", taskCode)
 	}
-	start, end := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds)
+	start, end := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds, cfg.IntervalMinutes)
 	return e.produceRange(ctx, cfg, start, end)
 }
 
@@ -286,12 +286,13 @@ func (e *Engine) recoverMinuteGaps(ctx context.Context, cfg TaskConfig) error {
 		return err
 	}
 	if !ok {
-		start, _ := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds)
-		lastEnd = start.Add(-time.Minute)
+		start, end := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds, cfg.IntervalMinutes)
+		lastEnd = start.Add(-(end.Sub(start)))
 	}
-	cutoffStart, _ := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds)
-	for t := lastEnd; t.Before(cutoffStart); t = t.Add(time.Minute) {
-		start, end := t, t.Add(time.Minute)
+	cutoffStart, _ := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds, cfg.IntervalMinutes)
+	step := minuteInterval(cfg.IntervalMinutes)
+	for t := lastEnd; t.Before(cutoffStart); t = t.Add(step) {
+		start, end := t, t.Add(step)
 		exists, err := e.logRepo.ExistsByTaskAndTimeRange(ctx, cfg.TaskCode, start, end)
 		if err != nil {
 			return err
@@ -437,9 +438,20 @@ func (e *Engine) resumeBig(ctx context.Context) error {
 	})
 }
 
-func calcMinuteRange(now time.Time, delaySeconds int) (time.Time, time.Time) {
-	t := now.Add(-time.Duration(delaySeconds) * time.Second).Truncate(time.Minute).Add(-time.Minute)
-	return t, t.Add(time.Minute)
+func calcMinuteRange(now time.Time, delaySeconds int, intervalMinutes int) (time.Time, time.Time) {
+	interval := minuteInterval(intervalMinutes)
+	anchor := now.Add(-time.Duration(delaySeconds) * time.Second).Truncate(time.Minute)
+	alignedEndUnix := (anchor.Unix() / int64(interval/time.Second)) * int64(interval/time.Second)
+	end := time.Unix(alignedEndUnix, 0).In(anchor.Location())
+	start := end.Add(-interval)
+	return start, end
+}
+
+func minuteInterval(intervalMinutes int) time.Duration {
+	if intervalMinutes <= 0 {
+		intervalMinutes = 1
+	}
+	return time.Duration(intervalMinutes) * time.Minute
 }
 
 func (e *Engine) runInParallel(configs []TaskConfig, fn func(cfg TaskConfig) error) error {
