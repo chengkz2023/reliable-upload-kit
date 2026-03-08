@@ -21,6 +21,8 @@ type uploadLogModel struct {
 	TimeStart  time.Time `gorm:"column:time_start;not null;index:idx_scan,priority:3"`
 	TimeEnd    time.Time `gorm:"column:time_end;not null"`
 	FileName   string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
+	BizKey     string    `gorm:"column:biz_key;type:varchar(128)"`
+	MetaJSON   string    `gorm:"column:meta_json;type:text"`
 	Status     uint8     `gorm:"column:status;not null;default:0;index:idx_scan,priority:2"`
 	BackupPath string    `gorm:"column:backup_path;type:varchar(512)"`
 	RetryCount int       `gorm:"column:retry_count;not null;default:0"`
@@ -51,6 +53,8 @@ type bigTaskBatchModel struct {
 	InstanceID int64     `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
 	BatchIndex int       `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
 	FileName   string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
+	BizKey     string    `gorm:"column:biz_key;type:varchar(128)"`
+	MetaJSON   string    `gorm:"column:meta_json;type:text"`
 	BackupPath string    `gorm:"column:backup_path;type:varchar(512)"`
 	Status     uint8     `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
 	RetryCount int       `gorm:"column:retry_count;not null;default:0"`
@@ -130,6 +134,8 @@ func (r *mysqlUploadLogRepo) Create(ctx context.Context, log reliableupload.Uplo
 		TimeStart:  log.TimeStart,
 		TimeEnd:    log.TimeEnd,
 		FileName:   log.FileName,
+		BizKey:     log.BizKey,
+		MetaJSON:   log.MetaJSON,
 		Status:     uint8(log.Status),
 		BackupPath: log.BackupPath,
 		RetryCount: log.RetryCount,
@@ -170,6 +176,8 @@ func (r *mysqlUploadLogRepo) FindPendingByCode(ctx context.Context, taskCode str
 			TimeStart:  row.TimeStart,
 			TimeEnd:    row.TimeEnd,
 			FileName:   row.FileName,
+			BizKey:     row.BizKey,
+			MetaJSON:   row.MetaJSON,
 			Status:     reliableupload.Status(row.Status),
 			BackupPath: row.BackupPath,
 			RetryCount: row.RetryCount,
@@ -262,6 +270,8 @@ func (r *mysqlBigRepo) CreateBatch(ctx context.Context, batch reliableupload.Big
 		InstanceID: batch.InstanceID,
 		BatchIndex: batch.BatchIndex,
 		FileName:   batch.FileName,
+		BizKey:     batch.BizKey,
+		MetaJSON:   batch.MetaJSON,
 		BackupPath: batch.BackupPath,
 		Status:     uint8(batch.Status),
 		RetryCount: batch.RetryCount,
@@ -314,6 +324,8 @@ func (r *mysqlBigRepo) FindPendingBatches(ctx context.Context, instanceID int64,
 			InstanceID: row.InstanceID,
 			BatchIndex: row.BatchIndex,
 			FileName:   row.FileName,
+			BizKey:     row.BizKey,
+			MetaJSON:   row.MetaJSON,
 			BackupPath: row.BackupPath,
 			Status:     reliableupload.Status(row.Status),
 			RetryCount: row.RetryCount,

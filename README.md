@@ -39,17 +39,12 @@ go run ./example
 
 ```go
 type DataSource interface {
-    FetchAndEncode(ctx context.Context, cfg TaskConfig, start, end time.Time) ([][]byte, error)
-}
-
-// 可选：大任务超大窗口时建议实现
-type BigDataSource interface {
-    CountBatches(ctx context.Context, cfg TaskConfig, start, end time.Time) (int, error)
-    FetchAndEncodeBatch(ctx context.Context, cfg TaskConfig, start, end time.Time, batchIndex int) ([]byte, error)
+    CountChunks(ctx context.Context, cfg TaskConfig, start, end time.Time) (int, error)
+    FetchChunk(ctx context.Context, cfg TaskConfig, start, end time.Time, index int) (Chunk, error)
 }
 
 type Reporter interface {
-    Upload(ctx context.Context, cfg TaskConfig, fileName string, data []byte) error
+    Upload(ctx context.Context, cfg TaskConfig, item UploadItem) error
 }
 ```
 

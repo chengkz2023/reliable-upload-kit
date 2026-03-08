@@ -2,6 +2,7 @@ package reliableupload
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
@@ -35,10 +36,7 @@ func WithLogger(logger Logger) EngineOption {
 // WithLoggerFuncs allows injecting plain function callbacks as logger.
 func WithLoggerFuncs(infof func(string, ...any), errorf func(string, ...any)) EngineOption {
 	return func(e *Engine) {
-		e.logger = LoggerFuncs{
-			InfofFunc:  infof,
-			ErrorfFunc: errorf,
-		}
+		e.logger = LoggerFuncs{InfofFunc: infof, ErrorfFunc: errorf}
 	}
 }
 
@@ -89,7 +87,6 @@ func (e *Engine) RunProducer(ctx context.Context) error {
 }
 
 // ProduceForTask produces one explicit time range for the given task_code.
-// This API is useful when developers want full control over trigger timing.
 func (e *Engine) ProduceForTask(ctx context.Context, taskCode string, start, end time.Time) error {
 	cfg, err := e.cfgRepo.Get(ctx, taskCode)
 	if err != nil {
@@ -101,7 +98,7 @@ func (e *Engine) ProduceForTask(ctx context.Context, taskCode string, start, end
 	return e.produceRange(ctx, cfg, start, end)
 }
 
-// ProduceCurrentWindowForTask produces only the current minute window for one task.
+// ProduceCurrentWindowForTask produces only current minute window for one task.
 func (e *Engine) ProduceCurrentWindowForTask(ctx context.Context, taskCode string) error {
 	cfg, err := e.cfgRepo.Get(ctx, taskCode)
 	if err != nil {
@@ -114,9 +111,7 @@ func (e *Engine) ProduceCurrentWindowForTask(ctx context.Context, taskCode strin
 	return e.produceRange(ctx, cfg, start, end)
 }
 
-// RunUploader is a compatibility entrypoint that uploads both:
-// 1) minute pending logs
-// 2) big-task pending batches
+// RunUploader is compatibility entrypoint that uploads minute + big task pending records.
 func (e *Engine) RunUploader(ctx context.Context) error {
 	if err := e.RunMinuteUploader(ctx); err != nil {
 		return err
@@ -124,17 +119,10 @@ func (e *Engine) RunUploader(ctx context.Context) error {
 	return e.RunBigUploader(ctx)
 }
 
-// RunMinuteUploader uploads minute-task pending logs only.
-func (e *Engine) RunMinuteUploader(ctx context.Context) error {
-	return e.uploadMinute(ctx)
-}
+func (e *Engine) RunMinuteUploader(ctx context.Context) error { return e.uploadMinute(ctx) }
+func (e *Engine) RunBigUploader(ctx context.Context) error    { return e.uploadBig(ctx) }
 
-// RunBigUploader uploads big-task pending batches only.
-func (e *Engine) RunBigUploader(ctx context.Context) error {
-	return e.uploadBig(ctx)
-}
-
-// UploadPendingForTask uploads minute pending logs only for one task_code.
+// UploadPendingForTask uploads minute pending logs for one task_code.
 func (e *Engine) UploadPendingForTask(ctx context.Context, taskCode string) error {
 	cfg, err := e.cfgRepo.Get(ctx, taskCode)
 	if err != nil {
@@ -143,7 +131,7 @@ func (e *Engine) UploadPendingForTask(ctx context.Context, taskCode string) erro
 	return e.uploadMinuteByTaskCode(ctx, cfg)
 }
 
-// OnStartup backfills minute gaps and resumes big running instances.
+// OnStartup backfills minute gaps and resumes running big tasks.
 func (e *Engine) OnStartup(ctx context.Context) error {
 	configs, err := e.cfgRepo.FindEnabledByType(ctx, TaskTypeMinute)
 	if err != nil {
@@ -157,7 +145,7 @@ func (e *Engine) OnStartup(ctx context.Context) error {
 	return e.resumeBig(ctx)
 }
 
-// RunBigTask creates/resumes one custom-window big task and uploads all pending batches.
+// RunBigTask creates/resumes one custom-window big task and uploads pending batches.
 func (e *Engine) RunBigTask(ctx context.Context, taskCode string, windowStart, windowEnd time.Time) error {
 	cfg, err := e.cfgRepo.Get(ctx, taskCode)
 	if err != nil {
@@ -190,19 +178,20 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 	if err != nil {
 		return err
 	}
-	chunks, err := ds.FetchAndEncode(ctx, cfg, start, end)
+	total, err := ds.CountChunks(ctx, cfg, start, end)
 	if err != nil {
 		return err
 	}
-	if len(chunks) == 0 {
-		namer := e.fileNamerForTask(cfg.TaskCode)
-		fileName := namer.MinuteFileName(cfg, start, end, 0)
+	if total < 0 {
+		return fmt.Errorf("task=%s invalid chunk count: %d", cfg.TaskCode, total)
+	}
+	if total == 0 {
 		now := e.clock.Now()
 		log := UploadLog{
 			TaskCode:   cfg.TaskCode,
 			TimeStart:  start,
 			TimeEnd:    end,
-			FileName:   fileName,
+			FileName:   e.fileName(cfg, start, end, 0, Chunk{}),
 			Status:     StatusUploaded,
 			BackupPath: "",
 			CreatedAt:  now,
@@ -210,10 +199,17 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 		}
 		return e.logRepo.Create(ctx, log)
 	}
-	for i, chunk := range chunks {
-		namer := e.fileNamerForTask(cfg.TaskCode)
-		fileName := namer.MinuteFileName(cfg, start, end, i+1)
-		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk)
+	for index := 1; index <= total; index++ {
+		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
+		if err != nil {
+			return err
+		}
+		fileName := e.fileName(cfg, start, end, index, chunk)
+		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
+		if err != nil {
+			return err
+		}
+		metaJSON, err := encodeMeta(chunk.Meta)
 		if err != nil {
 			return err
 		}
@@ -223,6 +219,8 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 			TimeStart:  start,
 			TimeEnd:    end,
 			FileName:   fileName,
+			BizKey:     chunk.BizKey,
+			MetaJSON:   metaJSON,
 			Status:     StatusPending,
 			BackupPath: backupPath,
 			CreatedAt:  now,
@@ -265,8 +263,13 @@ func (e *Engine) uploadMinuteByTaskCode(ctx context.Context, cfg TaskConfig) err
 			e.logRepo.IncrRetry(ctx, log.ID, err.Error())
 			return err
 		}
-		err = rp.Upload(ctx, cfg, log.FileName, data)
+		meta, err := decodeMeta(log.MetaJSON)
 		if err != nil {
+			e.logRepo.IncrRetry(ctx, log.ID, err.Error())
+			return err
+		}
+		item := UploadItem{FileName: log.FileName, Data: data, BizKey: log.BizKey, Meta: meta, BackupPath: log.BackupPath}
+		if err := rp.Upload(ctx, cfg, item); err != nil {
 			e.logRepo.IncrRetry(ctx, log.ID, err.Error())
 			return err
 		}
@@ -308,65 +311,32 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 	if err != nil {
 		return err
 	}
-	start := inst.WindowStart
-	end := inst.WindowEnd
+	start, end := inst.WindowStart, inst.WindowEnd
+	total, err := ds.CountChunks(ctx, cfg, start, end)
+	if err != nil {
+		return err
+	}
+	if total < 0 {
+		return fmt.Errorf("task=%s invalid chunk count: %d", cfg.TaskCode, total)
+	}
+	if err := e.bigRepo.UpdateProducedMeta(ctx, inst.ID, total, 0); err != nil {
+		return err
+	}
 	existingCount, err := e.bigRepo.CountBatches(ctx, inst.ID)
 	if err != nil {
 		return err
 	}
-	if pagedDS, ok := ds.(BigDataSource); ok {
-		totalBatches, err := pagedDS.CountBatches(ctx, cfg, start, end)
+	for index := existingCount + 1; index <= total; index++ {
+		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
 		if err != nil {
 			return err
 		}
-		if totalBatches < 0 {
-			return fmt.Errorf("task=%s invalid total batches: %d", cfg.TaskCode, totalBatches)
-		}
-		// Persist total batches before producing files so progress denominator is visible immediately.
-		if err := e.bigRepo.UpdateProducedMeta(ctx, inst.ID, totalBatches, 0); err != nil {
+		fileName := e.fileName(cfg, start, end, index, chunk)
+		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
+		if err != nil {
 			return err
 		}
-		for index := existingCount + 1; index <= totalBatches; index++ {
-			chunk, err := pagedDS.FetchAndEncodeBatch(ctx, cfg, start, end, index)
-			if err != nil {
-				return err
-			}
-			namer := e.fileNamerForTask(cfg.TaskCode)
-			fileName := namer.BigFileName(cfg, start, end, index)
-			backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk)
-			if err != nil {
-				return err
-			}
-			now := e.clock.Now()
-			batch := BigTaskBatch{
-				InstanceID: inst.ID,
-				BatchIndex: index,
-				FileName:   fileName,
-				BackupPath: backupPath,
-				Status:     StatusPending,
-				CreatedAt:  now,
-				UpdatedAt:  now,
-			}
-			if err := e.bigRepo.CreateBatch(ctx, batch); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	chunks, err := ds.FetchAndEncode(ctx, cfg, start, end)
-	if err != nil {
-		return err
-	}
-	// For legacy datasource mode, total is known after fetch and is stored before batch persistence.
-	if err := e.bigRepo.UpdateProducedMeta(ctx, inst.ID, len(chunks), 0); err != nil {
-		return err
-	}
-	for index := existingCount + 1; index <= len(chunks); index++ {
-		chunk := chunks[index-1]
-		namer := e.fileNamerForTask(cfg.TaskCode)
-		fileName := namer.BigFileName(cfg, start, end, index)
-		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk)
+		metaJSON, err := encodeMeta(chunk.Meta)
 		if err != nil {
 			return err
 		}
@@ -375,6 +345,8 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 			InstanceID: inst.ID,
 			BatchIndex: index,
 			FileName:   fileName,
+			BizKey:     chunk.BizKey,
+			MetaJSON:   metaJSON,
 			BackupPath: backupPath,
 			Status:     StatusPending,
 			CreatedAt:  now,
@@ -416,8 +388,13 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
 			return err
 		}
-		err = rp.Upload(ctx, cfg, b.FileName, data)
+		meta, err := decodeMeta(b.MetaJSON)
 		if err != nil {
+			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
+			return err
+		}
+		item := UploadItem{FileName: b.FileName, Data: data, BizKey: b.BizKey, Meta: meta, BackupPath: b.BackupPath}
+		if err := rp.Upload(ctx, cfg, item); err != nil {
 			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
 			return err
 		}
@@ -433,11 +410,7 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 	if err != nil {
 		return err
 	}
-	if total == 0 {
-		_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
-		return nil
-	}
-	if uploaded >= total {
+	if total == 0 || uploaded >= total {
 		_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
 	}
 	return nil
@@ -526,10 +499,9 @@ func (e *Engine) runInParallelInstances(instances []BigTaskInstance, fn func(ins
 func joinErrors(errCh <-chan error) error {
 	msgs := make([]string, 0)
 	for err := range errCh {
-		if err == nil {
-			continue
+		if err != nil {
+			msgs = append(msgs, err.Error())
 		}
-		msgs = append(msgs, err.Error())
 	}
 	if len(msgs) == 0 {
 		return nil
@@ -548,11 +520,7 @@ func (noopLogger) Errorf(string, ...any) {}
 
 type defaultFileNamer struct{}
 
-func (defaultFileNamer) MinuteFileName(cfg TaskConfig, start, end time.Time, batchIndex int) string {
-	return fmt.Sprintf("%s_%s_%s_%03d.dat", cfg.FilePrefix, start.Format("20060102150405"), end.Format("20060102150405"), batchIndex)
-}
-
-func (defaultFileNamer) BigFileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int) string {
+func (defaultFileNamer) FileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, _ Chunk) string {
 	return fmt.Sprintf("%s_%s_%s_%03d.dat", cfg.FilePrefix, windowStart.Format("20060102150405"), windowEnd.Format("20060102150405"), batchIndex)
 }
 
@@ -565,4 +533,30 @@ func (e *Engine) fileNamerForTask(taskCode string) FileNamer {
 		return namer
 	}
 	return e.namer
+}
+
+func (e *Engine) fileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, chunk Chunk) string {
+	return e.fileNamerForTask(cfg.TaskCode).FileName(cfg, windowStart, windowEnd, batchIndex, chunk)
+}
+
+func encodeMeta(meta map[string]string) (string, error) {
+	if len(meta) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func decodeMeta(metaJSON string) (map[string]string, error) {
+	if metaJSON == "" {
+		return nil, nil
+	}
+	var out map[string]string
+	if err := json.Unmarshal([]byte(metaJSON), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

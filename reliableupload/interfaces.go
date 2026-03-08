@@ -2,28 +2,20 @@ package reliableupload
 
 import (
 	"context"
-	"io"
 	"time"
 )
 
-// DataSource is implemented by business teams.
-// Framework calls it to fetch and encode data into upload-ready chunks.
+// DataSource is the only data production interface.
+// It must provide deterministic chunk count and chunk-by-index fetch.
 type DataSource interface {
-	FetchAndEncode(ctx context.Context, cfg TaskConfig, start, end time.Time) ([][]byte, error)
+	CountChunks(ctx context.Context, cfg TaskConfig, start, end time.Time) (int, error)
+	FetchChunk(ctx context.Context, cfg TaskConfig, start, end time.Time, index int) (Chunk, error)
 }
 
-// BigDataSource is optional and used only for large-window big tasks.
-// It allows the engine to avoid loading all data into memory at once.
-// Engine will prefer this interface for TaskTypeBig when implemented.
-type BigDataSource interface {
-	CountBatches(ctx context.Context, cfg TaskConfig, start, end time.Time) (int, error)
-	FetchAndEncodeBatch(ctx context.Context, cfg TaskConfig, start, end time.Time, batchIndex int) ([]byte, error)
-}
-
-// Reporter is implemented by business teams for idempotent upload.
-// Implementations should treat existing remote files as success.
+// Reporter is the only upload interface.
+// It receives UploadItem with business metadata.
 type Reporter interface {
-	Upload(ctx context.Context, cfg TaskConfig, fileName string, data []byte) error
+	Upload(ctx context.Context, cfg TaskConfig, item UploadItem) error
 }
 
 // BackupStore persists produced files as the single source for retries.
@@ -93,19 +85,12 @@ type Clock interface {
 	Now() time.Time
 }
 
-// FileNamer allows custom file naming strategy.
+// FileNamer builds file name with full chunk context.
 type FileNamer interface {
-	MinuteFileName(cfg TaskConfig, start, end time.Time, batchIndex int) string
-	BigFileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int) string
+	FileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, chunk Chunk) string
 }
 
 // Reconciler can optionally detect backup-vs-log drifts and alert.
 type Reconciler interface {
 	Reconcile(ctx context.Context) error
-}
-
-// BackupReaderWriter helper for implementations using filesystems.
-type BackupReaderWriter interface {
-	io.ReaderAt
-	io.WriterAt
 }
