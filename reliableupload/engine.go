@@ -191,7 +191,7 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 			TaskCode:   cfg.TaskCode,
 			TimeStart:  start,
 			TimeEnd:    end,
-			FileName:   e.fileName(cfg, start, end, 0, Chunk{}),
+			FileName:   e.fileName(cfg, start, end, 0, NameContext{}),
 			Status:     StatusUploaded,
 			BackupPath: "",
 			CreatedAt:  now,
@@ -204,7 +204,7 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 		if err != nil {
 			return err
 		}
-		fileName := e.fileName(cfg, start, end, index, chunk)
+		fileName := e.fileName(cfg, start, end, index, NameContext{BizKey: chunk.BizKey, Meta: chunk.Meta})
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
 		if err != nil {
 			return err
@@ -331,7 +331,7 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 		if err != nil {
 			return err
 		}
-		fileName := e.fileName(cfg, start, end, index, chunk)
+		fileName := e.fileName(cfg, start, end, index, NameContext{BizKey: chunk.BizKey, Meta: chunk.Meta})
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
 		if err != nil {
 			return err
@@ -520,7 +520,7 @@ func (noopLogger) Errorf(string, ...any) {}
 
 type defaultFileNamer struct{}
 
-func (defaultFileNamer) FileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, _ Chunk) string {
+func (defaultFileNamer) FileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, _ NameContext) string {
 	return fmt.Sprintf("%s_%s_%s_%03d.dat", cfg.FilePrefix, windowStart.Format("20060102150405"), windowEnd.Format("20060102150405"), batchIndex)
 }
 
@@ -535,8 +535,8 @@ func (e *Engine) fileNamerForTask(taskCode string) FileNamer {
 	return e.namer
 }
 
-func (e *Engine) fileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, chunk Chunk) string {
-	return e.fileNamerForTask(cfg.TaskCode).FileName(cfg, windowStart, windowEnd, batchIndex, chunk)
+func (e *Engine) fileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, ctx NameContext) string {
+	return e.fileNamerForTask(cfg.TaskCode).FileName(cfg, windowStart, windowEnd, batchIndex, ctx)
 }
 
 func encodeMeta(meta map[string]string) (string, error) {

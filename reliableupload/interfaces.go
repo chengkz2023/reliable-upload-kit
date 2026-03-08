@@ -85,9 +85,9 @@ type Clock interface {
 	Now() time.Time
 }
 
-// FileNamer builds file name with full chunk context.
+// FileNamer builds file name with lightweight naming context.
 type FileNamer interface {
-	FileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, chunk Chunk) string
+	FileName(cfg TaskConfig, windowStart, windowEnd time.Time, batchIndex int, ctx NameContext) string
 }
 
 // Reconciler can optionally detect backup-vs-log drifts and alert.

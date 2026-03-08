@@ -40,6 +40,12 @@ type Chunk struct {
 	Meta   map[string]string
 }
 
+// NameContext carries lightweight naming metadata only.
+type NameContext struct {
+	BizKey string
+	Meta   map[string]string
+}
+
 // UploadItem is the runtime payload passed to enhanced reporter.
 type UploadItem struct {
 	FileName   string
