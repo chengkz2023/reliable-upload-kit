@@ -56,6 +56,21 @@ type BigTaskRepo interface {
 	MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error
 }
 
+// BizTaskRepo provides business-trigger task persistence.
+type BizTaskRepo interface {
+	GetOrCreateInstance(ctx context.Context, taskCode, triggerKey, triggerPayload string) (BizTaskInstance, error)
+	UpdateProducedMeta(ctx context.Context, instanceID int64, totalBatches, totalRecords int) error
+	CreateBatch(ctx context.Context, batch BizTaskBatch) error
+	FindRunningInstances(ctx context.Context) ([]BizTaskInstance, error)
+	CountBatches(ctx context.Context, instanceID int64) (int, error)
+	SumBatchRecords(ctx context.Context, instanceID int64) (int, error)
+	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]BizTaskBatch, error)
+	MarkBatchUploaded(ctx context.Context, batchID int64) error
+	IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error
+	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
+	MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error
+}
+
 // Logger is optional; nil-safe no-op logger is used by default.
 type Logger interface {
 	Infof(format string, args ...any)

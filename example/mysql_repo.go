@@ -66,6 +66,39 @@ type bigTaskBatchModel struct {
 
 func (bigTaskBatchModel) TableName() string { return "big_task_batch" }
 
+type bizTaskInstanceModel struct {
+	ID              int64      `gorm:"column:id;primaryKey;autoIncrement"`
+	TaskCode        string     `gorm:"column:task_code;type:varchar(64);not null;uniqueIndex:uk_task_trigger,priority:1;index:idx_status,priority:1"`
+	TriggerKey      string     `gorm:"column:trigger_key;type:varchar(128);not null;uniqueIndex:uk_task_trigger,priority:2"`
+	TriggerPayload  string     `gorm:"column:trigger_payload;type:text"`
+	Status          uint8      `gorm:"column:status;not null;default:0;index:idx_status,priority:2"`
+	TotalBatches    int        `gorm:"column:total_batches"`
+	UploadedBatches int        `gorm:"column:uploaded_batches;not null;default:0"`
+	TotalRecords    int        `gorm:"column:total_records"`
+	StartedAt       time.Time  `gorm:"column:started_at"`
+	FinishedAt      *time.Time `gorm:"column:finished_at"`
+}
+
+func (bizTaskInstanceModel) TableName() string { return "biz_task_instance" }
+
+type bizTaskBatchModel struct {
+	ID          int64     `gorm:"column:id;primaryKey;autoIncrement"`
+	InstanceID  int64     `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
+	BatchIndex  int       `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
+	FileName    string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
+	RecordCount int       `gorm:"column:record_count;not null;default:0"`
+	BizKey      string    `gorm:"column:biz_key;type:varchar(128)"`
+	MetaJSON    string    `gorm:"column:meta_json;type:text"`
+	BackupPath  string    `gorm:"column:backup_path;type:varchar(512)"`
+	Status      uint8     `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
+	RetryCount  int       `gorm:"column:retry_count;not null;default:0"`
+	ErrMsg      string    `gorm:"column:err_msg;type:varchar(1024)"`
+	CreatedAt   time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt   time.Time `gorm:"column:updated_at;autoUpdateTime"`
+}
+
+func (bizTaskBatchModel) TableName() string { return "biz_task_batch" }
+
 func openMySQL(dsn string) (*gorm.DB, error) {
 	return gorm.Open(mysql.Open(dsn), &gorm.Config{})
 }
@@ -107,7 +140,13 @@ func splitMySQLDSN(dsn string) (adminDSN, dbName string, err error) {
 }
 
 func initMySQLSchema(db *gorm.DB) error {
-	return db.AutoMigrate(&uploadLogModel{}, &bigTaskInstanceModel{}, &bigTaskBatchModel{})
+	return db.AutoMigrate(
+		&uploadLogModel{},
+		&bigTaskInstanceModel{},
+		&bigTaskBatchModel{},
+		&bizTaskInstanceModel{},
+		&bizTaskBatchModel{},
+	)
 }
 
 type mysqlUploadLogRepo struct {
@@ -391,12 +430,198 @@ func (r *mysqlBigRepo) MarkInstanceCompleted(ctx context.Context, instanceID int
 		}).Error
 }
 
+type mysqlBizRepo struct {
+	db *gorm.DB
+}
+
+func newMySQLBizRepo(db *gorm.DB) *mysqlBizRepo {
+	return &mysqlBizRepo{db: db}
+}
+
+func (r *mysqlBizRepo) GetOrCreateInstance(ctx context.Context, taskCode, triggerKey, triggerPayload string) (reliableupload.BizTaskInstance, error) {
+	inst := bizTaskInstanceModel{
+		TaskCode:       taskCode,
+		TriggerKey:     triggerKey,
+		TriggerPayload: triggerPayload,
+		Status:         uint8(reliableupload.StatusRunning),
+		StartedAt:      time.Now(),
+	}
+	err := r.db.WithContext(ctx).
+		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "task_code"}, {Name: "trigger_key"}}, DoNothing: true}).
+		Create(&inst).Error
+	if err != nil {
+		return reliableupload.BizTaskInstance{}, err
+	}
+
+	var got bizTaskInstanceModel
+	err = r.db.WithContext(ctx).
+		Where("task_code = ? AND trigger_key = ?", taskCode, triggerKey).
+		First(&got).Error
+	if err != nil {
+		return reliableupload.BizTaskInstance{}, err
+	}
+	return toBizInstance(got), nil
+}
+
+func (r *mysqlBizRepo) UpdateProducedMeta(ctx context.Context, instanceID int64, totalBatches, totalRecords int) error {
+	return r.db.WithContext(ctx).
+		Model(&bizTaskInstanceModel{}).
+		Where("id = ?", instanceID).
+		Updates(map[string]any{"total_batches": totalBatches, "total_records": totalRecords}).
+		Error
+}
+
+func (r *mysqlBizRepo) CreateBatch(ctx context.Context, batch reliableupload.BizTaskBatch) error {
+	m := bizTaskBatchModel{
+		InstanceID:  batch.InstanceID,
+		BatchIndex:  batch.BatchIndex,
+		FileName:    batch.FileName,
+		RecordCount: batch.RecordCount,
+		BizKey:      batch.BizKey,
+		MetaJSON:    batch.MetaJSON,
+		BackupPath:  batch.BackupPath,
+		Status:      uint8(batch.Status),
+		RetryCount:  batch.RetryCount,
+		ErrMsg:      batch.ErrMsg,
+		CreatedAt:   batch.CreatedAt,
+		UpdatedAt:   batch.UpdatedAt,
+	}
+	return r.db.WithContext(ctx).Create(&m).Error
+}
+
+func (r *mysqlBizRepo) FindRunningInstances(ctx context.Context) ([]reliableupload.BizTaskInstance, error) {
+	var rows []bizTaskInstanceModel
+	err := r.db.WithContext(ctx).
+		Where("status = ?", uint8(reliableupload.StatusRunning)).
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]reliableupload.BizTaskInstance, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toBizInstance(row))
+	}
+	return out, nil
+}
+
+func (r *mysqlBizRepo) CountBatches(ctx context.Context, instanceID int64) (int, error) {
+	var cnt int64
+	err := r.db.WithContext(ctx).
+		Model(&bizTaskBatchModel{}).
+		Where("instance_id = ?", instanceID).
+		Count(&cnt).Error
+	return int(cnt), err
+}
+
+func (r *mysqlBizRepo) SumBatchRecords(ctx context.Context, instanceID int64) (int, error) {
+	var total sql.NullInt64
+	err := r.db.WithContext(ctx).
+		Model(&bizTaskBatchModel{}).
+		Where("instance_id = ?", instanceID).
+		Select("COALESCE(SUM(record_count), 0)").
+		Scan(&total).Error
+	if err != nil {
+		return 0, err
+	}
+	if !total.Valid {
+		return 0, nil
+	}
+	return int(total.Int64), nil
+}
+
+func (r *mysqlBizRepo) FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]reliableupload.BizTaskBatch, error) {
+	var rows []bizTaskBatchModel
+	err := r.db.WithContext(ctx).
+		Model(&bizTaskBatchModel{}).
+		Where("instance_id = ? AND status = ? AND retry_count <= ?", instanceID, uint8(reliableupload.StatusPending), maxRetry).
+		Order("batch_index ASC").
+		Limit(limit).
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]reliableupload.BizTaskBatch, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, reliableupload.BizTaskBatch{
+			ID:          row.ID,
+			InstanceID:  row.InstanceID,
+			BatchIndex:  row.BatchIndex,
+			FileName:    row.FileName,
+			RecordCount: row.RecordCount,
+			BizKey:      row.BizKey,
+			MetaJSON:    row.MetaJSON,
+			BackupPath:  row.BackupPath,
+			Status:      reliableupload.Status(row.Status),
+			RetryCount:  row.RetryCount,
+			ErrMsg:      row.ErrMsg,
+			CreatedAt:   row.CreatedAt,
+			UpdatedAt:   row.UpdatedAt,
+		})
+	}
+	return out, nil
+}
+
+func (r *mysqlBizRepo) MarkBatchUploaded(ctx context.Context, batchID int64) error {
+	return r.db.WithContext(ctx).
+		Model(&bizTaskBatchModel{}).
+		Where("id = ?", batchID).
+		Updates(map[string]any{"status": uint8(reliableupload.StatusUploaded), "updated_at": time.Now()}).
+		Error
+}
+
+func (r *mysqlBizRepo) IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error {
+	return r.db.WithContext(ctx).
+		Model(&bizTaskBatchModel{}).
+		Where("id = ?", batchID).
+		Updates(map[string]any{"retry_count": gorm.Expr("retry_count + 1"), "err_msg": errMsg, "updated_at": time.Now()}).
+		Error
+}
+
+func (r *mysqlBizRepo) CountUploadedBatches(ctx context.Context, instanceID int64) (int, error) {
+	var cnt int64
+	err := r.db.WithContext(ctx).
+		Model(&bizTaskBatchModel{}).
+		Where("instance_id = ? AND status = ?", instanceID, uint8(reliableupload.StatusUploaded)).
+		Count(&cnt).Error
+	return int(cnt), err
+}
+
+func (r *mysqlBizRepo) MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error {
+	uploaded, err := r.CountUploadedBatches(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	return r.db.WithContext(ctx).
+		Model(&bizTaskInstanceModel{}).
+		Where("id = ?", instanceID).
+		Updates(map[string]any{
+			"status":           uint8(reliableupload.StatusUploaded),
+			"uploaded_batches": uploaded,
+			"finished_at":      finishedAt,
+		}).Error
+}
+
 func toBigInstance(m bigTaskInstanceModel) reliableupload.BigTaskInstance {
 	return reliableupload.BigTaskInstance{
 		ID:              m.ID,
 		TaskCode:        m.TaskCode,
 		WindowStart:     m.WindowStart,
 		WindowEnd:       m.WindowEnd,
+		Status:          reliableupload.Status(m.Status),
+		TotalBatches:    m.TotalBatches,
+		UploadedBatches: m.UploadedBatches,
+		TotalRecords:    m.TotalRecords,
+		StartedAt:       m.StartedAt,
+		FinishedAt:      m.FinishedAt,
+	}
+}
+
+func toBizInstance(m bizTaskInstanceModel) reliableupload.BizTaskInstance {
+	return reliableupload.BizTaskInstance{
+		ID:              m.ID,
+		TaskCode:        m.TaskCode,
+		TriggerKey:      m.TriggerKey,
+		TriggerPayload:  m.TriggerPayload,
 		Status:          reliableupload.Status(m.Status),
 		TotalBatches:    m.TotalBatches,
 		UploadedBatches: m.UploadedBatches,

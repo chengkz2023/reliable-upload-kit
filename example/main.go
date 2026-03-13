@@ -36,6 +36,8 @@ func main() {
 	registry.RegisterReporter("order_minute", rp)
 	registry.RegisterDataSource("order_big", ds)
 	registry.RegisterReporter("order_big", rp)
+	registry.RegisterDataSource("order_biz", ds)
+	registry.RegisterReporter("order_biz", rp)
 
 	cfgRepo := &memConfigRepo{m: map[string]reliableupload.TaskConfig{
 		"order_minute": {
@@ -58,6 +60,15 @@ func main() {
 			FilePrefix: "order_big",
 			Enabled:    true,
 		},
+		"order_biz": {
+			TaskCode:   "order_biz",
+			TaskType:   reliableupload.TaskTypeBiz,
+			BatchSize:  2000,
+			MaxRetry:   3,
+			SFTPSubdir: "/remote/order",
+			FilePrefix: "order_biz",
+			Enabled:    true,
+		},
 	}}
 
 	engine := reliableupload.NewEngine(
@@ -65,6 +76,7 @@ func main() {
 		cfgRepo,
 		newMySQLUploadLogRepo(db),
 		newMySQLBigRepo(db),
+		newMySQLBizRepo(db),
 		reliableupload.NewFSBackupStore("./backup"),
 	)
 
@@ -73,6 +85,7 @@ func main() {
 	bigStart := time.Now().Add(-time.Hour).Truncate(time.Hour)
 	bigEnd := bigStart.Add(time.Hour)
 	_ = engine.RunBigTask(ctx, "order_big", bigStart, bigEnd)
+	_ = engine.RunBizTask(ctx, "order_biz", "approval_1001", `{"operator":"ops","scene":"manual"}`)
 
 	fmt.Println("uploaded files:")
 	for _, name := range rp.UploadedFiles() {
@@ -89,14 +102,20 @@ func envOrDefault(key, defaultValue string) string {
 
 type demoDataSource struct{}
 
-func (d *demoDataSource) CountChunks(_ context.Context, cfg reliableupload.TaskConfig, _, _ time.Time) (int, error) {
+func (d *demoDataSource) CountChunks(ctx context.Context, cfg reliableupload.TaskConfig, _, _ time.Time) (int, error) {
 	if cfg.TaskType == reliableupload.TaskTypeBig {
 		return 2, nil
+	}
+	if cfg.TaskType == reliableupload.TaskTypeBiz {
+		if trigger, ok := reliableupload.BizTriggerFromContext(ctx); ok && trigger.Key != "" {
+			return 2, nil
+		}
+		return 1, nil
 	}
 	return 1, nil
 }
 
-func (d *demoDataSource) FetchChunk(_ context.Context, cfg reliableupload.TaskConfig, start, _ time.Time, index int) (reliableupload.Chunk, error) {
+func (d *demoDataSource) FetchChunk(ctx context.Context, cfg reliableupload.TaskConfig, start, _ time.Time, index int) (reliableupload.Chunk, error) {
 	if cfg.TaskType == reliableupload.TaskTypeBig {
 		return reliableupload.Chunk{
 			Data:        []byte(fmt.Sprintf("%s chunk-%d %s", cfg.TaskCode, index, start.Format("2006-01-02"))),
@@ -105,6 +124,18 @@ func (d *demoDataSource) FetchChunk(_ context.Context, cfg reliableupload.TaskCo
 			Meta: map[string]string{
 				"channel": "demo",
 				"bucket":  fmt.Sprintf("%d", index),
+			},
+		}, nil
+	}
+	if cfg.TaskType == reliableupload.TaskTypeBiz {
+		trigger, _ := reliableupload.BizTriggerFromContext(ctx)
+		return reliableupload.Chunk{
+			Data:        []byte(fmt.Sprintf("%s trigger=%s payload=%s chunk=%d", cfg.TaskCode, trigger.Key, trigger.Payload, index)),
+			RecordCount: 50,
+			BizKey:      trigger.Key,
+			Meta: map[string]string{
+				"trigger_key": trigger.Key,
+				"kind":        "biz",
 			},
 		}, nil
 	}

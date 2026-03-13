@@ -3,6 +3,7 @@
 面向生产环境的 Go 可靠上报框架：
 - 分钟任务（小批量）
 - 自定义大任务（任意时间窗口）
+- 业务触发任务（无强时间条件）
 
 ## 功能特性
 
@@ -10,7 +11,7 @@
 - 状态机驱动（`pending` / `uploaded` / `failed` / `running`）
 - 生产与上报解耦（Cron A / Cron B）
 - 按 `task_code` 隔离并发
-- 启动恢复（分钟补窗 + 大任务断点续传）
+- 启动恢复（分钟补窗 + 大任务/业务任务断点续传）
 - 按 `task_code` 自由触发生产/上报
 - 按 `task_code` 自定义文件命名
 - `WithLoggerFuncs` 便于接入 zap
@@ -48,14 +49,22 @@ type Reporter interface {
 }
 ```
 
+业务触发上下文可通过 helper 读取：
+
+```go
+trigger, ok := reliableupload.BizTriggerFromContext(ctx)
+```
+
 ## 核心入口
 
 - `RunProducer(ctx)`
-- `RunUploader(ctx)`（兼容入口：分钟+大任务都跑）
+- `RunUploader(ctx)`（兼容入口：分钟+大任务+业务任务都跑）
 - `RunMinuteUploader(ctx)`（仅分钟任务上传）
 - `RunBigUploader(ctx)`（仅大任务上传）
+- `RunBizUploader(ctx)`（仅业务任务上传）
 - `OnStartup(ctx)`
 - `RunBigTask(ctx, taskCode, windowStart, windowEnd)`
+- `RunBizTask(ctx, taskCode, triggerKey, triggerPayload)`
 
 ## License
 

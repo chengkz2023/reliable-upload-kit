@@ -8,6 +8,7 @@ type TaskType uint8
 const (
 	TaskTypeMinute TaskType = 1
 	TaskTypeBig    TaskType = 2
+	TaskTypeBiz    TaskType = 3
 )
 
 // Status tracks upload progress.
@@ -17,7 +18,7 @@ const (
 	StatusPending  Status = 0
 	StatusUploaded Status = 1
 	StatusFailed   Status = 2
-	StatusRunning  Status = 3 // big task instance only
+	StatusRunning  Status = 3 // big/biz task instance only
 )
 
 // TaskConfig is runtime configuration loaded from repository.
@@ -40,7 +41,7 @@ type TaskConfig struct {
 type Chunk struct {
 	Data []byte
 	// RecordCount is the business row count represented by this chunk.
-	// Engine uses it to persist BigTaskInstance.TotalRecords.
+	// Engine uses it to persist BigTaskInstance/BizTaskInstance.TotalRecords.
 	RecordCount int
 	BizKey      string
 	Meta        map[string]string
@@ -94,6 +95,43 @@ type BigTaskInstance struct {
 
 // BigTaskBatch tracks one file batch for a big task instance.
 type BigTaskBatch struct {
+	ID          int64
+	InstanceID  int64
+	BatchIndex  int
+	FileName    string
+	RecordCount int
+	BizKey      string
+	MetaJSON    string
+	BackupPath  string
+	Status      Status
+	RetryCount  int
+	ErrMsg      string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// BizTrigger carries one business-trigger event context.
+type BizTrigger struct {
+	Key     string
+	Payload string
+}
+
+// BizTaskInstance tracks one (task_code, trigger_key) run.
+type BizTaskInstance struct {
+	ID              int64
+	TaskCode        string
+	TriggerKey      string
+	TriggerPayload  string
+	Status          Status
+	TotalBatches    int
+	UploadedBatches int
+	TotalRecords    int
+	StartedAt       time.Time
+	FinishedAt      *time.Time
+}
+
+// BizTaskBatch tracks one file batch for a biz task instance.
+type BizTaskBatch struct {
 	ID          int64
 	InstanceID  int64
 	BatchIndex  int

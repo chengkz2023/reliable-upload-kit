@@ -1,16 +1,11 @@
 ﻿# reliableupload 开发者接入文档
 
-`reliableupload` 现在采用两类任务模型：
+`reliableupload` 现在采用三类任务模型：
 - 分钟任务（小批量，自动窗口）
 - 自定义大任务（任意时间窗口，由业务触发）
+- 业务触发任务（无强时间条件，由 trigger_key 触发）
 
-## 1. 核心变化
-
-- 已去掉“每日任务”固定概念
-- 改为 `TaskTypeBig` + `RunBigTask(ctx, taskCode, windowStart, windowEnd)`
-- 大任务可用于每日、每小时、每 10 分钟或任意补数窗口
-
-## 2. 接口契约
+## 1. 接口契约
 
 定义见 [reliableupload/interfaces.go](../reliableupload/interfaces.go)。
 
@@ -25,50 +20,35 @@ type Reporter interface {
 }
 ```
 
-- `DataSource` 统一负责分钟任务/大任务的数据分批生产
-- `Reporter` 统一负责上报并可直接使用 `item.BizKey/item.Meta`
+业务触发任务里可通过上下文读取触发参数：
 
-## 3. 引擎能力
+```go
+trigger, ok := reliableupload.BizTriggerFromContext(ctx)
+```
+
+## 2. 引擎能力
 
 定义见 [reliableupload/engine.go](../reliableupload/engine.go)。
 
 - `RunProducer(ctx)`：扫描所有分钟任务并生产
-- `RunUploader(ctx)`：兼容入口，统一上传分钟与大任务 pending
+- `RunUploader(ctx)`：兼容入口，统一上传分钟/大任务/业务任务 pending
 - `RunMinuteUploader(ctx)`：仅上传分钟任务 pending
 - `RunBigUploader(ctx)`：仅上传大任务 pending
-- `OnStartup(ctx)`：分钟补窗 + 恢复 running 大任务
+- `RunBizUploader(ctx)`：仅上传业务任务 pending
+- `OnStartup(ctx)`：分钟补窗 + 恢复 running 大任务 + 恢复 running 业务任务
 - `RunBigTask(ctx, taskCode, start, end)`：创建/恢复一个大任务窗口
+- `RunBizTask(ctx, taskCode, triggerKey, triggerPayload)`：创建/恢复一个业务触发任务实例
 
-自由触发 API（推荐）：
-- `ProduceCurrentWindowForTask(ctx, taskCode)`
-- `ProduceForTask(ctx, taskCode, start, end)`
-- `UploadPendingForTask(ctx, taskCode)`
+## 3. 幂等建议
 
-## 4. 日志接入（zap）
+`RunBizTask` 建议使用稳定的业务键作为 `triggerKey`，例如：
+- 审批单号
+- 结算批次号
+- 活动ID+版本号
 
-可直接使用函数注入：
+并在实例表上建立唯一键 `(task_code, trigger_key)`，实现触发幂等。
 
-```go
-engine := reliableupload.NewEngine(
-    registry, cfgRepo, uploadLogRepo, bigRepo, backup,
-    reliableupload.WithLoggerFuncs(
-        func(format string, args ...any) { zap.L().Sugar().Infof(format, args...) },
-        func(format string, args ...any) { zap.L().Sugar().Errorf(format, args...) },
-    ),
-)
-```
-
-## 5. 文件名策略
-
-默认文件名可用；若某个 `task_code` 需要特殊规则：
-
-```go
-registry.RegisterFileNamer("order_big", myNamer)
-```
-
-框架会优先使用任务级命名器，没有则回退全局命名器。
-
-## 6. MySQL/GORM 示例
+## 4. MySQL/GORM 示例
 
 可参考：
 - [example/main.go](../example/main.go)
@@ -78,14 +58,5 @@ registry.RegisterFileNamer("order_big", myNamer)
 - `uploadlog`
 - `big_task_instance`
 - `big_task_batch`
-
-## 7. 调度建议
-
-- Cron A（每分钟）：`RunProducer`
-- Cron B（每分钟，错峰 20~40 秒）：可按需选择
-- 仅分钟任务上传：`RunMinuteUploader`
-- 仅大任务上传：`RunBigUploader`
-- 或兼容入口：`RunUploader`
-- 自定义调度器：按你的业务频率触发 `RunBigTask`
-- 服务启动后执行一次：`OnStartup`
-
+- `biz_task_instance`
+- `biz_task_batch`

@@ -19,6 +19,7 @@ type Engine struct {
 	cfgRepo      TaskConfigRepo
 	logRepo      UploadLogRepo
 	bigRepo      BigTaskRepo
+	bizRepo      BizTaskRepo
 	backup       BackupStore
 	clock        Clock
 	logger       Logger
@@ -56,12 +57,13 @@ func WithPendingLimit(limit int) EngineOption {
 	}
 }
 
-func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo, bigRepo BigTaskRepo, backup BackupStore, opts ...EngineOption) *Engine {
+func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo, bigRepo BigTaskRepo, bizRepo BizTaskRepo, backup BackupStore, opts ...EngineOption) *Engine {
 	e := &Engine{
 		registry:     registry,
 		cfgRepo:      cfgRepo,
 		logRepo:      logRepo,
 		bigRepo:      bigRepo,
+		bizRepo:      bizRepo,
 		backup:       backup,
 		clock:        systemClock{},
 		logger:       noopLogger{},
@@ -111,16 +113,26 @@ func (e *Engine) ProduceCurrentWindowForTask(ctx context.Context, taskCode strin
 	return e.produceRange(ctx, cfg, start, end)
 }
 
-// RunUploader is compatibility entrypoint that uploads minute + big task pending records.
+// RunUploader is compatibility entrypoint that uploads minute + big + biz pending records.
 func (e *Engine) RunUploader(ctx context.Context) error {
 	if err := e.RunMinuteUploader(ctx); err != nil {
 		return err
 	}
-	return e.RunBigUploader(ctx)
+	if err := e.RunBigUploader(ctx); err != nil {
+		return err
+	}
+	return e.RunBizUploader(ctx)
 }
 
 func (e *Engine) RunMinuteUploader(ctx context.Context) error { return e.uploadMinute(ctx) }
 func (e *Engine) RunBigUploader(ctx context.Context) error    { return e.uploadBig(ctx) }
+
+func (e *Engine) RunBizUploader(ctx context.Context) error {
+	if e.bizRepo == nil {
+		return nil
+	}
+	return e.uploadBiz(ctx)
+}
 
 // UploadPendingForTask uploads minute pending logs for one task_code.
 func (e *Engine) UploadPendingForTask(ctx context.Context, taskCode string) error {
@@ -131,7 +143,7 @@ func (e *Engine) UploadPendingForTask(ctx context.Context, taskCode string) erro
 	return e.uploadMinuteByTaskCode(ctx, cfg)
 }
 
-// OnStartup backfills minute gaps and resumes running big tasks.
+// OnStartup backfills minute gaps and resumes running big/biz tasks.
 func (e *Engine) OnStartup(ctx context.Context) error {
 	configs, err := e.cfgRepo.FindEnabledByType(ctx, TaskTypeMinute)
 	if err != nil {
@@ -142,11 +154,17 @@ func (e *Engine) OnStartup(ctx context.Context) error {
 			e.logger.Errorf("recover minute gap failed task=%s err=%v", cfg.TaskCode, err)
 		}
 	}
-	return e.resumeBig(ctx)
+	if err := e.resumeBig(ctx); err != nil {
+		return err
+	}
+	return e.resumeBiz(ctx)
 }
 
 // RunBigTask creates/resumes one custom-window big task and uploads pending batches.
 func (e *Engine) RunBigTask(ctx context.Context, taskCode string, windowStart, windowEnd time.Time) error {
+	if e.bigRepo == nil {
+		return fmt.Errorf("big repo not configured")
+	}
 	cfg, err := e.cfgRepo.Get(ctx, taskCode)
 	if err != nil {
 		return err
@@ -164,6 +182,33 @@ func (e *Engine) RunBigTask(ctx context.Context, taskCode string, windowStart, w
 		}
 	}
 	return e.uploadPendingBigBatches(ctx, cfg, inst.ID)
+}
+
+// RunBizTask creates/resumes one business-trigger task and uploads pending batches.
+func (e *Engine) RunBizTask(ctx context.Context, taskCode, triggerKey, triggerPayload string) error {
+	if e.bizRepo == nil {
+		return fmt.Errorf("biz repo not configured")
+	}
+	if triggerKey == "" {
+		return fmt.Errorf("trigger_key is required")
+	}
+	cfg, err := e.cfgRepo.Get(ctx, taskCode)
+	if err != nil {
+		return err
+	}
+	if cfg.TaskType != TaskTypeBiz {
+		return fmt.Errorf("task=%s is not biz task type", taskCode)
+	}
+	inst, err := e.bizRepo.GetOrCreateInstance(ctx, taskCode, triggerKey, triggerPayload)
+	if err != nil {
+		return err
+	}
+	if inst.TotalBatches == 0 {
+		if err := e.produceBiz(ctx, cfg, inst); err != nil {
+			return err
+		}
+	}
+	return e.uploadPendingBizBatches(ctx, cfg, inst.ID)
 }
 
 func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end time.Time) error {
@@ -367,7 +412,77 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 	return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, total, existingRecords+newRecords)
 }
 
+func (e *Engine) produceBiz(ctx context.Context, cfg TaskConfig, inst BizTaskInstance) error {
+	ds, err := e.registry.DataSource(cfg.TaskCode)
+	if err != nil {
+		return err
+	}
+	ctx = WithBizTrigger(ctx, BizTrigger{Key: inst.TriggerKey, Payload: inst.TriggerPayload})
+	anchor := inst.StartedAt
+	if anchor.IsZero() {
+		anchor = e.clock.Now()
+	}
+	start, end := anchor, anchor
+	total, err := ds.CountChunks(ctx, cfg, start, end)
+	if err != nil {
+		return err
+	}
+	if total < 0 {
+		return fmt.Errorf("task=%s invalid chunk count: %d", cfg.TaskCode, total)
+	}
+	existingCount, err := e.bizRepo.CountBatches(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	existingRecords, err := e.bizRepo.SumBatchRecords(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	newRecords := 0
+	for index := existingCount + 1; index <= total; index++ {
+		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
+		if err != nil {
+			return err
+		}
+		if chunk.RecordCount < 0 {
+			return fmt.Errorf("task=%s invalid record count at batch=%d: %d", cfg.TaskCode, index, chunk.RecordCount)
+		}
+		nameMeta := cloneMeta(chunk.Meta)
+		nameMeta["trigger_key"] = inst.TriggerKey
+		fileName := e.fileName(cfg, start, end, index, NameContext{BizKey: chunk.BizKey, Meta: nameMeta})
+		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
+		if err != nil {
+			return err
+		}
+		metaJSON, err := encodeMeta(chunk.Meta)
+		if err != nil {
+			return err
+		}
+		now := e.clock.Now()
+		batch := BizTaskBatch{
+			InstanceID:  inst.ID,
+			BatchIndex:  index,
+			FileName:    fileName,
+			RecordCount: chunk.RecordCount,
+			BizKey:      chunk.BizKey,
+			MetaJSON:    metaJSON,
+			BackupPath:  backupPath,
+			Status:      StatusPending,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		if err := e.bizRepo.CreateBatch(ctx, batch); err != nil {
+			return err
+		}
+		newRecords += chunk.RecordCount
+	}
+	return e.bizRepo.UpdateProducedMeta(ctx, inst.ID, total, existingRecords+newRecords)
+}
+
 func (e *Engine) uploadBig(ctx context.Context) error {
+	if e.bigRepo == nil {
+		return nil
+	}
 	instances, err := e.bigRepo.FindRunningInstances(ctx)
 	if err != nil {
 		return err
@@ -424,7 +539,67 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 	return nil
 }
 
+func (e *Engine) uploadBiz(ctx context.Context) error {
+	instances, err := e.bizRepo.FindRunningInstances(ctx)
+	if err != nil {
+		return err
+	}
+	return e.runInParallelBizInstances(instances, func(inst BizTaskInstance) error {
+		cfg, err := e.cfgRepo.Get(ctx, inst.TaskCode)
+		if err != nil {
+			return err
+		}
+		return e.uploadPendingBizBatches(ctx, cfg, inst.ID)
+	})
+}
+
+func (e *Engine) uploadPendingBizBatches(ctx context.Context, cfg TaskConfig, instanceID int64) error {
+	rp, err := e.registry.Reporter(cfg.TaskCode)
+	if err != nil {
+		return err
+	}
+	batches, err := e.bizRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, e.pendingLimit)
+	if err != nil {
+		return err
+	}
+	for _, b := range batches {
+		data, err := e.backup.Read(ctx, b.BackupPath)
+		if err != nil {
+			e.bizRepo.IncrBatchRetry(ctx, b.ID, err.Error())
+			return err
+		}
+		meta, err := decodeMeta(b.MetaJSON)
+		if err != nil {
+			e.bizRepo.IncrBatchRetry(ctx, b.ID, err.Error())
+			return err
+		}
+		item := UploadItem{FileName: b.FileName, Data: data, BizKey: b.BizKey, Meta: meta, BackupPath: b.BackupPath}
+		if err := rp.Upload(ctx, cfg, item); err != nil {
+			e.bizRepo.IncrBatchRetry(ctx, b.ID, err.Error())
+			return err
+		}
+		if err := e.bizRepo.MarkBatchUploaded(ctx, b.ID); err != nil {
+			return err
+		}
+	}
+	uploaded, err := e.bizRepo.CountUploadedBatches(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	total, err := e.bizRepo.CountBatches(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	if total == 0 || uploaded >= total {
+		_ = e.bizRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
+	}
+	return nil
+}
+
 func (e *Engine) resumeBig(ctx context.Context) error {
+	if e.bigRepo == nil {
+		return nil
+	}
 	instances, err := e.bigRepo.FindRunningInstances(ctx)
 	if err != nil {
 		return err
@@ -442,6 +617,30 @@ func (e *Engine) resumeBig(ctx context.Context) error {
 			return e.produceBig(ctx, cfg, inst)
 		}
 		return e.uploadPendingBigBatches(ctx, cfg, inst.ID)
+	})
+}
+
+func (e *Engine) resumeBiz(ctx context.Context) error {
+	if e.bizRepo == nil {
+		return nil
+	}
+	instances, err := e.bizRepo.FindRunningInstances(ctx)
+	if err != nil {
+		return err
+	}
+	return e.runInParallelBizInstances(instances, func(inst BizTaskInstance) error {
+		cfg, err := e.cfgRepo.Get(ctx, inst.TaskCode)
+		if err != nil {
+			return err
+		}
+		batchCount, err := e.bizRepo.CountBatches(ctx, inst.ID)
+		if err != nil {
+			return err
+		}
+		if inst.TotalBatches > 0 && batchCount < inst.TotalBatches {
+			return e.produceBiz(ctx, cfg, inst)
+		}
+		return e.uploadPendingBizBatches(ctx, cfg, inst.ID)
 	})
 }
 
@@ -515,6 +714,24 @@ func (e *Engine) runInParallelInstances(instances []BigTaskInstance, fn func(ins
 	return joinErrors(errCh)
 }
 
+func (e *Engine) runInParallelBizInstances(instances []BizTaskInstance, fn func(inst BizTaskInstance) error) error {
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(instances))
+	for _, inst := range instances {
+		inst := inst
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(inst); err != nil {
+				errCh <- fmt.Errorf("biz_instance=%d: %w", inst.ID, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	return joinErrors(errCh)
+}
+
 func joinErrors(errCh <-chan error) error {
 	msgs := make([]string, 0)
 	for err := range errCh {
@@ -578,4 +795,12 @@ func decodeMeta(metaJSON string) (map[string]string, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+func cloneMeta(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
