@@ -48,6 +48,7 @@ type BigTaskRepo interface {
 	CreateBatch(ctx context.Context, batch BigTaskBatch) error
 	FindRunningInstances(ctx context.Context) ([]BigTaskInstance, error)
 	CountBatches(ctx context.Context, instanceID int64) (int, error)
+	SumBatchRecords(ctx context.Context, instanceID int64) (int, error)
 	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]BigTaskBatch, error)
 	MarkBatchUploaded(ctx context.Context, batchID int64) error
 	IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error

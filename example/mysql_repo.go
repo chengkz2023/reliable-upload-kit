@@ -49,18 +49,19 @@ type bigTaskInstanceModel struct {
 func (bigTaskInstanceModel) TableName() string { return "big_task_instance" }
 
 type bigTaskBatchModel struct {
-	ID         int64     `gorm:"column:id;primaryKey;autoIncrement"`
-	InstanceID int64     `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
-	BatchIndex int       `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
-	FileName   string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
-	BizKey     string    `gorm:"column:biz_key;type:varchar(128)"`
-	MetaJSON   string    `gorm:"column:meta_json;type:text"`
-	BackupPath string    `gorm:"column:backup_path;type:varchar(512)"`
-	Status     uint8     `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
-	RetryCount int       `gorm:"column:retry_count;not null;default:0"`
-	ErrMsg     string    `gorm:"column:err_msg;type:varchar(1024)"`
-	CreatedAt  time.Time `gorm:"column:created_at;autoCreateTime"`
-	UpdatedAt  time.Time `gorm:"column:updated_at;autoUpdateTime"`
+	ID          int64     `gorm:"column:id;primaryKey;autoIncrement"`
+	InstanceID  int64     `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
+	BatchIndex  int       `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
+	FileName    string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
+	RecordCount int       `gorm:"column:record_count;not null;default:0"`
+	BizKey      string    `gorm:"column:biz_key;type:varchar(128)"`
+	MetaJSON    string    `gorm:"column:meta_json;type:text"`
+	BackupPath  string    `gorm:"column:backup_path;type:varchar(512)"`
+	Status      uint8     `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
+	RetryCount  int       `gorm:"column:retry_count;not null;default:0"`
+	ErrMsg      string    `gorm:"column:err_msg;type:varchar(1024)"`
+	CreatedAt   time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt   time.Time `gorm:"column:updated_at;autoUpdateTime"`
 }
 
 func (bigTaskBatchModel) TableName() string { return "big_task_batch" }
@@ -114,7 +115,6 @@ type mysqlUploadLogRepo struct {
 }
 
 func newMySQLUploadLogRepo(db *gorm.DB) *mysqlUploadLogRepo {
-	// 仓储初始化：注入 gorm 连接，供 uploadlog 相关 CRUD 复用。
 	return &mysqlUploadLogRepo{db: db}
 }
 
@@ -128,7 +128,6 @@ func (r *mysqlUploadLogRepo) ExistsByTaskAndTimeRange(ctx context.Context, taskC
 }
 
 func (r *mysqlUploadLogRepo) Create(ctx context.Context, log reliableupload.UploadLog) error {
-	// 领域对象 -> 表模型：将引擎层 UploadLog 映射为 uploadlog 表结构。
 	m := uploadLogModel{
 		TaskCode:   log.TaskCode,
 		TimeStart:  log.TimeStart,
@@ -226,12 +225,10 @@ type mysqlBigRepo struct {
 }
 
 func newMySQLBigRepo(db *gorm.DB) *mysqlBigRepo {
-	// 仓储初始化：注入 gorm 连接，供大任务实例/分片表操作复用。
 	return &mysqlBigRepo{db: db}
 }
 
 func (r *mysqlBigRepo) GetOrCreateInstance(ctx context.Context, taskCode string, windowStart, windowEnd time.Time) (reliableupload.BigTaskInstance, error) {
-	// 初始化运行实例模型：首次创建窗口实例时默认置为 running。
 	inst := bigTaskInstanceModel{
 		TaskCode:    taskCode,
 		WindowStart: windowStart,
@@ -265,19 +262,19 @@ func (r *mysqlBigRepo) UpdateProducedMeta(ctx context.Context, instanceID int64,
 }
 
 func (r *mysqlBigRepo) CreateBatch(ctx context.Context, batch reliableupload.BigTaskBatch) error {
-	// 领域对象 -> 表模型：将待上传批次映射为 big_task_batch 行。
 	m := bigTaskBatchModel{
-		InstanceID: batch.InstanceID,
-		BatchIndex: batch.BatchIndex,
-		FileName:   batch.FileName,
-		BizKey:     batch.BizKey,
-		MetaJSON:   batch.MetaJSON,
-		BackupPath: batch.BackupPath,
-		Status:     uint8(batch.Status),
-		RetryCount: batch.RetryCount,
-		ErrMsg:     batch.ErrMsg,
-		CreatedAt:  batch.CreatedAt,
-		UpdatedAt:  batch.UpdatedAt,
+		InstanceID:  batch.InstanceID,
+		BatchIndex:  batch.BatchIndex,
+		FileName:    batch.FileName,
+		RecordCount: batch.RecordCount,
+		BizKey:      batch.BizKey,
+		MetaJSON:    batch.MetaJSON,
+		BackupPath:  batch.BackupPath,
+		Status:      uint8(batch.Status),
+		RetryCount:  batch.RetryCount,
+		ErrMsg:      batch.ErrMsg,
+		CreatedAt:   batch.CreatedAt,
+		UpdatedAt:   batch.UpdatedAt,
 	}
 	return r.db.WithContext(ctx).Create(&m).Error
 }
@@ -306,6 +303,22 @@ func (r *mysqlBigRepo) CountBatches(ctx context.Context, instanceID int64) (int,
 	return int(cnt), err
 }
 
+func (r *mysqlBigRepo) SumBatchRecords(ctx context.Context, instanceID int64) (int, error) {
+	var total sql.NullInt64
+	err := r.db.WithContext(ctx).
+		Model(&bigTaskBatchModel{}).
+		Where("instance_id = ?", instanceID).
+		Select("COALESCE(SUM(record_count), 0)").
+		Scan(&total).Error
+	if err != nil {
+		return 0, err
+	}
+	if !total.Valid {
+		return 0, nil
+	}
+	return int(total.Int64), nil
+}
+
 func (r *mysqlBigRepo) FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]reliableupload.BigTaskBatch, error) {
 	var rows []bigTaskBatchModel
 	err := r.db.WithContext(ctx).
@@ -320,18 +333,19 @@ func (r *mysqlBigRepo) FindPendingBatches(ctx context.Context, instanceID int64,
 	out := make([]reliableupload.BigTaskBatch, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, reliableupload.BigTaskBatch{
-			ID:         row.ID,
-			InstanceID: row.InstanceID,
-			BatchIndex: row.BatchIndex,
-			FileName:   row.FileName,
-			BizKey:     row.BizKey,
-			MetaJSON:   row.MetaJSON,
-			BackupPath: row.BackupPath,
-			Status:     reliableupload.Status(row.Status),
-			RetryCount: row.RetryCount,
-			ErrMsg:     row.ErrMsg,
-			CreatedAt:  row.CreatedAt,
-			UpdatedAt:  row.UpdatedAt,
+			ID:          row.ID,
+			InstanceID:  row.InstanceID,
+			BatchIndex:  row.BatchIndex,
+			FileName:    row.FileName,
+			RecordCount: row.RecordCount,
+			BizKey:      row.BizKey,
+			MetaJSON:    row.MetaJSON,
+			BackupPath:  row.BackupPath,
+			Status:      reliableupload.Status(row.Status),
+			RetryCount:  row.RetryCount,
+			ErrMsg:      row.ErrMsg,
+			CreatedAt:   row.CreatedAt,
+			UpdatedAt:   row.UpdatedAt,
 		})
 	}
 	return out, nil
@@ -378,7 +392,6 @@ func (r *mysqlBigRepo) MarkInstanceCompleted(ctx context.Context, instanceID int
 }
 
 func toBigInstance(m bigTaskInstanceModel) reliableupload.BigTaskInstance {
-	// 表模型 -> 领域对象：统一转换，避免查询侧重复字段拷贝代码。
 	return reliableupload.BigTaskInstance{
 		ID:              m.ID,
 		TaskCode:        m.TaskCode,

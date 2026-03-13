@@ -320,17 +320,22 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 	if total < 0 {
 		return fmt.Errorf("task=%s invalid chunk count: %d", cfg.TaskCode, total)
 	}
-	if err := e.bigRepo.UpdateProducedMeta(ctx, inst.ID, total, 0); err != nil {
-		return err
-	}
 	existingCount, err := e.bigRepo.CountBatches(ctx, inst.ID)
 	if err != nil {
 		return err
 	}
+	existingRecords, err := e.bigRepo.SumBatchRecords(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	newRecords := 0
 	for index := existingCount + 1; index <= total; index++ {
 		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
 		if err != nil {
 			return err
+		}
+		if chunk.RecordCount < 0 {
+			return fmt.Errorf("task=%s invalid record count at batch=%d: %d", cfg.TaskCode, index, chunk.RecordCount)
 		}
 		fileName := e.fileName(cfg, start, end, index, NameContext{BizKey: chunk.BizKey, Meta: chunk.Meta})
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
@@ -343,21 +348,23 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 		}
 		now := e.clock.Now()
 		batch := BigTaskBatch{
-			InstanceID: inst.ID,
-			BatchIndex: index,
-			FileName:   fileName,
-			BizKey:     chunk.BizKey,
-			MetaJSON:   metaJSON,
-			BackupPath: backupPath,
-			Status:     StatusPending,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			InstanceID:  inst.ID,
+			BatchIndex:  index,
+			FileName:    fileName,
+			RecordCount: chunk.RecordCount,
+			BizKey:      chunk.BizKey,
+			MetaJSON:    metaJSON,
+			BackupPath:  backupPath,
+			Status:      StatusPending,
+			CreatedAt:   now,
+			UpdatedAt:   now,
 		}
 		if err := e.bigRepo.CreateBatch(ctx, batch); err != nil {
 			return err
 		}
+		newRecords += chunk.RecordCount
 	}
-	return nil
+	return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, total, existingRecords+newRecords)
 }
 
 func (e *Engine) uploadBig(ctx context.Context) error {

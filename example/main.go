@@ -99,8 +99,9 @@ func (d *demoDataSource) CountChunks(_ context.Context, cfg reliableupload.TaskC
 func (d *demoDataSource) FetchChunk(_ context.Context, cfg reliableupload.TaskConfig, start, _ time.Time, index int) (reliableupload.Chunk, error) {
 	if cfg.TaskType == reliableupload.TaskTypeBig {
 		return reliableupload.Chunk{
-			Data:   []byte(fmt.Sprintf("%s chunk-%d %s", cfg.TaskCode, index, start.Format("2006-01-02"))),
-			BizKey: fmt.Sprintf("biz-%d", index),
+			Data:        []byte(fmt.Sprintf("%s chunk-%d %s", cfg.TaskCode, index, start.Format("2006-01-02"))),
+			RecordCount: 100,
+			BizKey:      fmt.Sprintf("biz-%d", index),
 			Meta: map[string]string{
 				"channel": "demo",
 				"bucket":  fmt.Sprintf("%d", index),

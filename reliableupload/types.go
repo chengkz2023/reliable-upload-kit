@@ -38,9 +38,12 @@ type TaskConfig struct {
 // Chunk is one upload unit with optional business metadata.
 // BizKey/Meta can drive file naming and reporting behavior.
 type Chunk struct {
-	Data   []byte
-	BizKey string
-	Meta   map[string]string
+	Data []byte
+	// RecordCount is the business row count represented by this chunk.
+	// Engine uses it to persist BigTaskInstance.TotalRecords.
+	RecordCount int
+	BizKey      string
+	Meta        map[string]string
 }
 
 // NameContext carries lightweight naming metadata only.
@@ -91,16 +94,17 @@ type BigTaskInstance struct {
 
 // BigTaskBatch tracks one file batch for a big task instance.
 type BigTaskBatch struct {
-	ID         int64
-	InstanceID int64
-	BatchIndex int
-	FileName   string
-	BizKey     string
-	MetaJSON   string
-	BackupPath string
-	Status     Status
-	RetryCount int
-	ErrMsg     string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID          int64
+	InstanceID  int64
+	BatchIndex  int
+	FileName    string
+	RecordCount int
+	BizKey      string
+	MetaJSON    string
+	BackupPath  string
+	Status      Status
+	RetryCount  int
+	ErrMsg      string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
