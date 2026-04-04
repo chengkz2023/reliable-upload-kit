@@ -24,6 +24,8 @@ type Engine struct {
 	clock        Clock
 	logger       Logger
 	namer        FileNamer
+	hooks        UploadHooks
+	failureMode  UploadFailureStrategy
 	pendingLimit int
 }
 
@@ -57,6 +59,21 @@ func WithPendingLimit(limit int) EngineOption {
 	}
 }
 
+func WithUploadHooks(hooks UploadHooks) EngineOption {
+	return func(e *Engine) {
+		if hooks != nil {
+			e.hooks = hooks
+		}
+	}
+}
+
+func WithUploadFailureStrategy(mode UploadFailureStrategy) EngineOption {
+	return func(e *Engine) {
+		if mode == UploadFailureContinue || mode == UploadFailureFailFast {
+			e.failureMode = mode
+		}
+	}
+}
 func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo, bigRepo BigTaskRepo, bizRepo BizTaskRepo, backup BackupStore, opts ...EngineOption) *Engine {
 	e := &Engine{
 		registry:     registry,
@@ -68,6 +85,8 @@ func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo
 		clock:        systemClock{},
 		logger:       noopLogger{},
 		namer:        defaultFileNamer{},
+		hooks:        noopUploadHooks{},
+		failureMode:  UploadFailureFailFast,
 		pendingLimit: defaultScanLimit,
 	}
 	for _, opt := range opts {
@@ -497,46 +516,33 @@ func (e *Engine) uploadBig(ctx context.Context) error {
 }
 
 func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, instanceID int64) error {
-	rp, err := e.registry.Reporter(cfg.TaskCode)
-	if err != nil {
-		return err
-	}
-	batches, err := e.bigRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, e.pendingLimit)
-	if err != nil {
-		return err
-	}
-	for _, b := range batches {
-		data, err := e.backup.Read(ctx, b.BackupPath)
-		if err != nil {
-			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
-			return err
-		}
-		meta, err := decodeMeta(b.MetaJSON)
-		if err != nil {
-			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
-			return err
-		}
-		item := UploadItem{FileName: b.FileName, Data: data, BizKey: b.BizKey, Meta: meta, BackupPath: b.BackupPath}
-		if err := rp.Upload(ctx, cfg, item); err != nil {
-			e.bigRepo.IncrBatchRetry(ctx, b.ID, err.Error())
-			return err
-		}
-		if err := e.bigRepo.MarkBatchUploaded(ctx, b.ID); err != nil {
-			return err
-		}
-	}
-	uploaded, err := e.bigRepo.CountUploadedBatches(ctx, instanceID)
-	if err != nil {
-		return err
-	}
-	total, err := e.bigRepo.CountBatches(ctx, instanceID)
-	if err != nil {
-		return err
-	}
-	if total == 0 || uploaded >= total {
-		_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
-	}
-	return nil
+	return e.uploadPendingBatches(ctx, cfg, uploadBatchOptions{
+		countUploaded: func() (int, error) {
+			return e.bigRepo.CountUploadedBatches(ctx, instanceID)
+		},
+		findPending: func(limit int) ([]uploadBatchRecord, error) {
+			batches, err := e.bigRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, limit)
+			if err != nil {
+				return nil, err
+			}
+			return toUploadBatchRecordsFromBig(batches), nil
+		},
+		incrRetry: func(batchID int64, errMsg string) {
+			e.bigRepo.IncrBatchRetry(ctx, batchID, errMsg)
+		},
+		markUploaded: func(batchID int64) error {
+			return e.bigRepo.MarkBatchUploaded(ctx, batchID)
+		},
+		updateUploaded: func(uploaded int) error {
+			return e.bigRepo.UpdateUploadedBatches(ctx, instanceID, uploaded)
+		},
+		countTotal: func() (int, error) {
+			return e.bigRepo.CountBatches(ctx, instanceID)
+		},
+		markCompleted: func(finishedAt time.Time) {
+			_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, finishedAt)
+		},
+	})
 }
 
 func (e *Engine) uploadBiz(ctx context.Context) error {
@@ -554,44 +560,176 @@ func (e *Engine) uploadBiz(ctx context.Context) error {
 }
 
 func (e *Engine) uploadPendingBizBatches(ctx context.Context, cfg TaskConfig, instanceID int64) error {
+	return e.uploadPendingBatches(ctx, cfg, uploadBatchOptions{
+		countUploaded: func() (int, error) {
+			return e.bizRepo.CountUploadedBatches(ctx, instanceID)
+		},
+		findPending: func(limit int) ([]uploadBatchRecord, error) {
+			batches, err := e.bizRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, limit)
+			if err != nil {
+				return nil, err
+			}
+			return toUploadBatchRecordsFromBiz(batches), nil
+		},
+		incrRetry: func(batchID int64, errMsg string) {
+			e.bizRepo.IncrBatchRetry(ctx, batchID, errMsg)
+		},
+		markUploaded: func(batchID int64) error {
+			return e.bizRepo.MarkBatchUploaded(ctx, batchID)
+		},
+		updateUploaded: func(uploaded int) error {
+			return e.bizRepo.UpdateUploadedBatches(ctx, instanceID, uploaded)
+		},
+		countTotal: func() (int, error) {
+			return e.bizRepo.CountBatches(ctx, instanceID)
+		},
+		markCompleted: func(finishedAt time.Time) {
+			_ = e.bizRepo.MarkInstanceCompleted(ctx, instanceID, finishedAt)
+		},
+	})
+}
+
+type uploadBatchRecord struct {
+	ID         int64
+	FileName   string
+	BizKey     string
+	MetaJSON   string
+	BackupPath string
+}
+
+type uploadBatchOptions struct {
+	countUploaded  func() (int, error)
+	findPending    func(limit int) ([]uploadBatchRecord, error)
+	incrRetry      func(batchID int64, errMsg string)
+	markUploaded   func(batchID int64) error
+	updateUploaded func(uploaded int) error
+	countTotal     func() (int, error)
+	markCompleted  func(finishedAt time.Time)
+}
+
+func toUploadBatchRecordsFromBig(in []BigTaskBatch) []uploadBatchRecord {
+	out := make([]uploadBatchRecord, 0, len(in))
+	for _, batch := range in {
+		out = append(out, uploadBatchRecord{
+			ID:         batch.ID,
+			FileName:   batch.FileName,
+			BizKey:     batch.BizKey,
+			MetaJSON:   batch.MetaJSON,
+			BackupPath: batch.BackupPath,
+		})
+	}
+	return out
+}
+
+func toUploadBatchRecordsFromBiz(in []BizTaskBatch) []uploadBatchRecord {
+	out := make([]uploadBatchRecord, 0, len(in))
+	for _, batch := range in {
+		out = append(out, uploadBatchRecord{
+			ID:         batch.ID,
+			FileName:   batch.FileName,
+			BizKey:     batch.BizKey,
+			MetaJSON:   batch.MetaJSON,
+			BackupPath: batch.BackupPath,
+		})
+	}
+	return out
+}
+
+func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, opts uploadBatchOptions) error {
 	rp, err := e.registry.Reporter(cfg.TaskCode)
 	if err != nil {
 		return err
 	}
-	batches, err := e.bizRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, e.pendingLimit)
+	uploaded, err := opts.countUploaded()
 	if err != nil {
 		return err
 	}
-	for _, b := range batches {
-		data, err := e.backup.Read(ctx, b.BackupPath)
+	attempted := map[int64]struct{}{}
+	errs := make([]string, 0)
+
+	handleBatchErr := func(batch uploadBatchRecord, item UploadItem, err error) error {
+		opts.incrRetry(batch.ID, err.Error())
+		e.hooks.OnUploadError(ctx, cfg, item, err)
+		if e.failureMode == UploadFailureFailFast {
+			return err
+		}
+		errs = append(errs, fmt.Sprintf("batch=%d: %v", batch.ID, err))
+		return nil
+	}
+
+	for {
+		queryLimit := e.pendingLimit
+		if e.failureMode == UploadFailureContinue {
+			queryLimit += len(attempted)
+		}
+		batches, err := opts.findPending(queryLimit)
 		if err != nil {
-			e.bizRepo.IncrBatchRetry(ctx, b.ID, err.Error())
 			return err
 		}
-		meta, err := decodeMeta(b.MetaJSON)
-		if err != nil {
-			e.bizRepo.IncrBatchRetry(ctx, b.ID, err.Error())
-			return err
+		if len(batches) == 0 {
+			break
 		}
-		item := UploadItem{FileName: b.FileName, Data: data, BizKey: b.BizKey, Meta: meta, BackupPath: b.BackupPath}
-		if err := rp.Upload(ctx, cfg, item); err != nil {
-			e.bizRepo.IncrBatchRetry(ctx, b.ID, err.Error())
-			return err
+
+		processed := 0
+		for _, batch := range batches {
+			if _, seen := attempted[batch.ID]; seen {
+				continue
+			}
+			attempted[batch.ID] = struct{}{}
+			processed++
+
+			data, err := e.backup.Read(ctx, batch.BackupPath)
+			if err != nil {
+				if handleErr := handleBatchErr(batch, UploadItem{FileName: batch.FileName, BackupPath: batch.BackupPath, BizKey: batch.BizKey}, err); handleErr != nil {
+					return handleErr
+				}
+				continue
+			}
+			meta, err := decodeMeta(batch.MetaJSON)
+			if err != nil {
+				if handleErr := handleBatchErr(batch, UploadItem{FileName: batch.FileName, BackupPath: batch.BackupPath, BizKey: batch.BizKey}, err); handleErr != nil {
+					return handleErr
+				}
+				continue
+			}
+
+			item := UploadItem{FileName: batch.FileName, Data: data, BizKey: batch.BizKey, Meta: meta, BackupPath: batch.BackupPath}
+			uploadCtx, uploadItem, err := e.hooks.BeforeUpload(ctx, cfg, item)
+			if err != nil {
+				if handleErr := handleBatchErr(batch, item, err); handleErr != nil {
+					return handleErr
+				}
+				continue
+			}
+			if err := rp.Upload(uploadCtx, cfg, uploadItem); err != nil {
+				if handleErr := handleBatchErr(batch, uploadItem, err); handleErr != nil {
+					return handleErr
+				}
+				continue
+			}
+			e.hooks.AfterUpload(uploadCtx, cfg, uploadItem)
+			if err := opts.markUploaded(batch.ID); err != nil {
+				return err
+			}
+			uploaded++
+			if err := opts.updateUploaded(uploaded); err != nil {
+				return err
+			}
 		}
-		if err := e.bizRepo.MarkBatchUploaded(ctx, b.ID); err != nil {
-			return err
+		if processed == 0 {
+			break
 		}
 	}
-	uploaded, err := e.bizRepo.CountUploadedBatches(ctx, instanceID)
-	if err != nil {
-		return err
-	}
-	total, err := e.bizRepo.CountBatches(ctx, instanceID)
+
+	total, err := opts.countTotal()
 	if err != nil {
 		return err
 	}
 	if total == 0 || uploaded >= total {
-		_ = e.bizRepo.MarkInstanceCompleted(ctx, instanceID, e.clock.Now())
+		opts.markCompleted(e.clock.Now())
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf(strings.Join(errs, " | "))
 	}
 	return nil
 }
@@ -753,6 +891,16 @@ type noopLogger struct{}
 
 func (noopLogger) Infof(string, ...any)  {}
 func (noopLogger) Errorf(string, ...any) {}
+
+type noopUploadHooks struct{}
+
+func (noopUploadHooks) BeforeUpload(ctx context.Context, _ TaskConfig, item UploadItem) (context.Context, UploadItem, error) {
+	return ctx, item, nil
+}
+
+func (noopUploadHooks) AfterUpload(context.Context, TaskConfig, UploadItem) {}
+
+func (noopUploadHooks) OnUploadError(context.Context, TaskConfig, UploadItem, error) {}
 
 type defaultFileNamer struct{}
 

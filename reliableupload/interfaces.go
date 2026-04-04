@@ -53,6 +53,7 @@ type BigTaskRepo interface {
 	MarkBatchUploaded(ctx context.Context, batchID int64) error
 	IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error
 	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
+	UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error
 	MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error
 }
 
@@ -68,7 +69,49 @@ type BizTaskRepo interface {
 	MarkBatchUploaded(ctx context.Context, batchID int64) error
 	IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error
 	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
+	UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error
 	MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error
+}
+
+// UploadFailureStrategy controls behavior when single batch upload fails.
+type UploadFailureStrategy uint8
+
+const (
+	UploadFailureFailFast UploadFailureStrategy = iota + 1
+	UploadFailureContinue
+)
+
+// UploadHooks allows optional custom actions around each upload attempt.
+type UploadHooks interface {
+	BeforeUpload(ctx context.Context, cfg TaskConfig, item UploadItem) (context.Context, UploadItem, error)
+	AfterUpload(ctx context.Context, cfg TaskConfig, item UploadItem)
+	OnUploadError(ctx context.Context, cfg TaskConfig, item UploadItem, err error)
+}
+
+// UploadHookFuncs adapts function callbacks to UploadHooks.
+type UploadHookFuncs struct {
+	BeforeUploadFunc func(ctx context.Context, cfg TaskConfig, item UploadItem) (context.Context, UploadItem, error)
+	AfterUploadFunc  func(ctx context.Context, cfg TaskConfig, item UploadItem)
+	OnUploadErrFunc  func(ctx context.Context, cfg TaskConfig, item UploadItem, err error)
+}
+
+func (h UploadHookFuncs) BeforeUpload(ctx context.Context, cfg TaskConfig, item UploadItem) (context.Context, UploadItem, error) {
+	if h.BeforeUploadFunc == nil {
+		return ctx, item, nil
+	}
+	return h.BeforeUploadFunc(ctx, cfg, item)
+}
+
+func (h UploadHookFuncs) AfterUpload(ctx context.Context, cfg TaskConfig, item UploadItem) {
+	if h.AfterUploadFunc != nil {
+		h.AfterUploadFunc(ctx, cfg, item)
+	}
+}
+
+func (h UploadHookFuncs) OnUploadError(ctx context.Context, cfg TaskConfig, item UploadItem, err error) {
+	if h.OnUploadErrFunc != nil {
+		h.OnUploadErrFunc(ctx, cfg, item, err)
+	}
 }
 
 // Logger is optional; nil-safe no-op logger is used by default.

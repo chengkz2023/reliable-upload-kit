@@ -78,6 +78,19 @@ func main() {
 		newMySQLBigRepo(db),
 		newMySQLBizRepo(db),
 		reliableupload.NewFSBackupStore("./backup"),
+		reliableupload.WithUploadFailureStrategy(reliableupload.UploadFailureContinue),
+		reliableupload.WithUploadHooks(reliableupload.UploadHookFuncs{
+			BeforeUploadFunc: func(ctx context.Context, cfg reliableupload.TaskConfig, item reliableupload.UploadItem) (context.Context, reliableupload.UploadItem, error) {
+				fmt.Printf("[hook/before] task=%s file=%s\n", cfg.TaskCode, item.FileName)
+				return ctx, item, nil
+			},
+			AfterUploadFunc: func(_ context.Context, cfg reliableupload.TaskConfig, item reliableupload.UploadItem) {
+				fmt.Printf("[hook/after] task=%s file=%s\n", cfg.TaskCode, item.FileName)
+			},
+			OnUploadErrFunc: func(_ context.Context, cfg reliableupload.TaskConfig, item reliableupload.UploadItem, err error) {
+				fmt.Printf("[hook/error] task=%s file=%s err=%v\n", cfg.TaskCode, item.FileName, err)
+			},
+		}),
 	)
 
 	_ = engine.RunProducer(ctx)

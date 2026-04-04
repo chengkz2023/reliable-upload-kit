@@ -415,6 +415,13 @@ func (r *mysqlBigRepo) CountUploadedBatches(ctx context.Context, instanceID int6
 	return int(cnt), err
 }
 
+func (r *mysqlBigRepo) UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error {
+	return r.db.WithContext(ctx).
+		Model(&bigTaskInstanceModel{}).
+		Where("id = ?", instanceID).
+		Update("uploaded_batches", uploadedBatches).
+		Error
+}
 func (r *mysqlBigRepo) MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error {
 	uploaded, err := r.CountUploadedBatches(ctx, instanceID)
 	if err != nil {
@@ -586,6 +593,13 @@ func (r *mysqlBizRepo) CountUploadedBatches(ctx context.Context, instanceID int6
 	return int(cnt), err
 }
 
+func (r *mysqlBizRepo) UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error {
+	return r.db.WithContext(ctx).
+		Model(&bizTaskInstanceModel{}).
+		Where("id = ?", instanceID).
+		Update("uploaded_batches", uploadedBatches).
+		Error
+}
 func (r *mysqlBizRepo) MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error {
 	uploaded, err := r.CountUploadedBatches(ctx, instanceID)
 	if err != nil {
