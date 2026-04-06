@@ -235,11 +235,18 @@ func (r *mysqlUploadLogRepo) MarkUploaded(ctx context.Context, id int64) error {
 		Error
 }
 
-func (r *mysqlUploadLogRepo) IncrRetry(ctx context.Context, id int64, errMsg string) error {
+func (r *mysqlUploadLogRepo) MarkRetryOrFailed(ctx context.Context, id int64, maxRetry int, errMsg string) error {
+	failed := uint8(reliableupload.StatusFailed)
+	pending := uint8(reliableupload.StatusPending)
 	return r.db.WithContext(ctx).
 		Model(&uploadLogModel{}).
 		Where("id = ?", id).
-		Updates(map[string]any{"retry_count": gorm.Expr("retry_count + 1"), "err_msg": errMsg, "updated_at": time.Now()}).
+		Updates(map[string]any{
+			"retry_count": gorm.Expr("retry_count + 1"),
+			"err_msg":     errMsg,
+			"status":      gorm.Expr("CASE WHEN retry_count + 1 > ? THEN ? ELSE ? END", maxRetry, failed, pending),
+			"updated_at":  time.Now(),
+		}).
 		Error
 }
 
@@ -398,11 +405,18 @@ func (r *mysqlBigRepo) MarkBatchUploaded(ctx context.Context, batchID int64) err
 		Error
 }
 
-func (r *mysqlBigRepo) IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error {
+func (r *mysqlBigRepo) MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error {
+	failed := uint8(reliableupload.StatusFailed)
+	pending := uint8(reliableupload.StatusPending)
 	return r.db.WithContext(ctx).
 		Model(&bigTaskBatchModel{}).
 		Where("id = ?", batchID).
-		Updates(map[string]any{"retry_count": gorm.Expr("retry_count + 1"), "err_msg": errMsg, "updated_at": time.Now()}).
+		Updates(map[string]any{
+			"retry_count": gorm.Expr("retry_count + 1"),
+			"err_msg":     errMsg,
+			"status":      gorm.Expr("CASE WHEN retry_count + 1 > ? THEN ? ELSE ? END", maxRetry, failed, pending),
+			"updated_at":  time.Now(),
+		}).
 		Error
 }
 
@@ -422,19 +436,29 @@ func (r *mysqlBigRepo) UpdateUploadedBatches(ctx context.Context, instanceID int
 		Update("uploaded_batches", uploadedBatches).
 		Error
 }
-func (r *mysqlBigRepo) MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error {
-	uploaded, err := r.CountUploadedBatches(ctx, instanceID)
+
+func (r *mysqlBigRepo) FinalizeInstance(ctx context.Context, instanceID int64, finishedAt time.Time) error {
+	total, uploaded, failed, err := batchCounts(ctx, r.db, instanceID, &bigTaskBatchModel{})
 	if err != nil {
 		return err
 	}
+	status := uint8(reliableupload.StatusRunning)
+	updates := map[string]any{"uploaded_batches": uploaded}
+	switch {
+	case total == 0 || uploaded >= total:
+		status = uint8(reliableupload.StatusUploaded)
+		updates["finished_at"] = finishedAt
+	case failed > 0 && uploaded+failed >= total:
+		status = uint8(reliableupload.StatusFailed)
+		updates["finished_at"] = finishedAt
+	default:
+		updates["finished_at"] = nil
+	}
+	updates["status"] = status
 	return r.db.WithContext(ctx).
 		Model(&bigTaskInstanceModel{}).
 		Where("id = ?", instanceID).
-		Updates(map[string]any{
-			"status":           uint8(reliableupload.StatusUploaded),
-			"uploaded_batches": uploaded,
-			"finished_at":      finishedAt,
-		}).Error
+		Updates(updates).Error
 }
 
 type mysqlBizRepo struct {
@@ -576,11 +600,18 @@ func (r *mysqlBizRepo) MarkBatchUploaded(ctx context.Context, batchID int64) err
 		Error
 }
 
-func (r *mysqlBizRepo) IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error {
+func (r *mysqlBizRepo) MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error {
+	failed := uint8(reliableupload.StatusFailed)
+	pending := uint8(reliableupload.StatusPending)
 	return r.db.WithContext(ctx).
 		Model(&bizTaskBatchModel{}).
 		Where("id = ?", batchID).
-		Updates(map[string]any{"retry_count": gorm.Expr("retry_count + 1"), "err_msg": errMsg, "updated_at": time.Now()}).
+		Updates(map[string]any{
+			"retry_count": gorm.Expr("retry_count + 1"),
+			"err_msg":     errMsg,
+			"status":      gorm.Expr("CASE WHEN retry_count + 1 > ? THEN ? ELSE ? END", maxRetry, failed, pending),
+			"updated_at":  time.Now(),
+		}).
 		Error
 }
 
@@ -600,19 +631,56 @@ func (r *mysqlBizRepo) UpdateUploadedBatches(ctx context.Context, instanceID int
 		Update("uploaded_batches", uploadedBatches).
 		Error
 }
-func (r *mysqlBizRepo) MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error {
-	uploaded, err := r.CountUploadedBatches(ctx, instanceID)
+
+func (r *mysqlBizRepo) FinalizeInstance(ctx context.Context, instanceID int64, finishedAt time.Time) error {
+	total, uploaded, failed, err := batchCounts(ctx, r.db, instanceID, &bizTaskBatchModel{})
 	if err != nil {
 		return err
 	}
+	status := uint8(reliableupload.StatusRunning)
+	updates := map[string]any{"uploaded_batches": uploaded}
+	switch {
+	case total == 0 || uploaded >= total:
+		status = uint8(reliableupload.StatusUploaded)
+		updates["finished_at"] = finishedAt
+	case failed > 0 && uploaded+failed >= total:
+		status = uint8(reliableupload.StatusFailed)
+		updates["finished_at"] = finishedAt
+	default:
+		updates["finished_at"] = nil
+	}
+	updates["status"] = status
 	return r.db.WithContext(ctx).
 		Model(&bizTaskInstanceModel{}).
 		Where("id = ?", instanceID).
-		Updates(map[string]any{
-			"status":           uint8(reliableupload.StatusUploaded),
-			"uploaded_batches": uploaded,
-			"finished_at":      finishedAt,
-		}).Error
+		Updates(updates).Error
+}
+
+func batchCounts(ctx context.Context, db *gorm.DB, instanceID int64, model any) (total int, uploaded int, failed int, err error) {
+	type row struct {
+		Status uint8
+		Count  int
+	}
+	var rows []row
+	err = db.WithContext(ctx).
+		Model(model).
+		Select("status, COUNT(*) AS count").
+		Where("instance_id = ?", instanceID).
+		Group("status").
+		Scan(&rows).Error
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for _, row := range rows {
+		total += row.Count
+		switch reliableupload.Status(row.Status) {
+		case reliableupload.StatusUploaded:
+			uploaded += row.Count
+		case reliableupload.StatusFailed:
+			failed += row.Count
+		}
+	}
+	return total, uploaded, failed, nil
 }
 
 func toBigInstance(m bigTaskInstanceModel) reliableupload.BigTaskInstance {

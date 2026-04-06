@@ -324,17 +324,17 @@ func (e *Engine) uploadMinuteByTaskCode(ctx context.Context, cfg TaskConfig) err
 	for _, log := range logs {
 		data, err := e.backup.Read(ctx, log.BackupPath)
 		if err != nil {
-			e.logRepo.IncrRetry(ctx, log.ID, err.Error())
+			_ = e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error())
 			return err
 		}
 		meta, err := decodeMeta(log.MetaJSON)
 		if err != nil {
-			e.logRepo.IncrRetry(ctx, log.ID, err.Error())
+			_ = e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error())
 			return err
 		}
 		item := UploadItem{FileName: log.FileName, Data: data, BizKey: log.BizKey, Meta: meta, BackupPath: log.BackupPath}
 		if err := rp.Upload(ctx, cfg, item); err != nil {
-			e.logRepo.IncrRetry(ctx, log.ID, err.Error())
+			_ = e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error())
 			return err
 		}
 		if err := e.logRepo.MarkUploaded(ctx, log.ID); err != nil {
@@ -527,8 +527,8 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 			}
 			return toUploadBatchRecordsFromBig(batches), nil
 		},
-		incrRetry: func(batchID int64, errMsg string) {
-			e.bigRepo.IncrBatchRetry(ctx, batchID, errMsg)
+		markRetryOrFailed: func(batchID int64, errMsg string) {
+			_ = e.bigRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
 		},
 		markUploaded: func(batchID int64) error {
 			return e.bigRepo.MarkBatchUploaded(ctx, batchID)
@@ -536,11 +536,8 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 		updateUploaded: func(uploaded int) error {
 			return e.bigRepo.UpdateUploadedBatches(ctx, instanceID, uploaded)
 		},
-		countTotal: func() (int, error) {
-			return e.bigRepo.CountBatches(ctx, instanceID)
-		},
-		markCompleted: func(finishedAt time.Time) {
-			_ = e.bigRepo.MarkInstanceCompleted(ctx, instanceID, finishedAt)
+		finalize: func(finishedAt time.Time) error {
+			return e.bigRepo.FinalizeInstance(ctx, instanceID, finishedAt)
 		},
 	})
 }
@@ -571,8 +568,8 @@ func (e *Engine) uploadPendingBizBatches(ctx context.Context, cfg TaskConfig, in
 			}
 			return toUploadBatchRecordsFromBiz(batches), nil
 		},
-		incrRetry: func(batchID int64, errMsg string) {
-			e.bizRepo.IncrBatchRetry(ctx, batchID, errMsg)
+		markRetryOrFailed: func(batchID int64, errMsg string) {
+			_ = e.bizRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
 		},
 		markUploaded: func(batchID int64) error {
 			return e.bizRepo.MarkBatchUploaded(ctx, batchID)
@@ -580,11 +577,8 @@ func (e *Engine) uploadPendingBizBatches(ctx context.Context, cfg TaskConfig, in
 		updateUploaded: func(uploaded int) error {
 			return e.bizRepo.UpdateUploadedBatches(ctx, instanceID, uploaded)
 		},
-		countTotal: func() (int, error) {
-			return e.bizRepo.CountBatches(ctx, instanceID)
-		},
-		markCompleted: func(finishedAt time.Time) {
-			_ = e.bizRepo.MarkInstanceCompleted(ctx, instanceID, finishedAt)
+		finalize: func(finishedAt time.Time) error {
+			return e.bizRepo.FinalizeInstance(ctx, instanceID, finishedAt)
 		},
 	})
 }
@@ -598,13 +592,12 @@ type uploadBatchRecord struct {
 }
 
 type uploadBatchOptions struct {
-	countUploaded  func() (int, error)
-	findPending    func(limit int) ([]uploadBatchRecord, error)
-	incrRetry      func(batchID int64, errMsg string)
-	markUploaded   func(batchID int64) error
-	updateUploaded func(uploaded int) error
-	countTotal     func() (int, error)
-	markCompleted  func(finishedAt time.Time)
+	countUploaded     func() (int, error)
+	findPending       func(limit int) ([]uploadBatchRecord, error)
+	markRetryOrFailed func(batchID int64, errMsg string)
+	markUploaded      func(batchID int64) error
+	updateUploaded    func(uploaded int) error
+	finalize          func(finishedAt time.Time) error
 }
 
 func toUploadBatchRecordsFromBig(in []BigTaskBatch) []uploadBatchRecord {
@@ -648,8 +641,11 @@ func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, opts 
 	errs := make([]string, 0)
 
 	handleBatchErr := func(batch uploadBatchRecord, item UploadItem, err error) error {
-		opts.incrRetry(batch.ID, err.Error())
+		opts.markRetryOrFailed(batch.ID, err.Error())
 		e.hooks.OnUploadError(ctx, cfg, item, err)
+		if finalizeErr := opts.finalize(e.clock.Now()); finalizeErr != nil {
+			return finalizeErr
+		}
 		if e.failureMode == UploadFailureFailFast {
 			return err
 		}
@@ -721,12 +717,8 @@ func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, opts 
 		}
 	}
 
-	total, err := opts.countTotal()
-	if err != nil {
+	if err := opts.finalize(e.clock.Now()); err != nil {
 		return err
-	}
-	if total == 0 || uploaded >= total {
-		opts.markCompleted(e.clock.Now())
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf(strings.Join(errs, " | "))

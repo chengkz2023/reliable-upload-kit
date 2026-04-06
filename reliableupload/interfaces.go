@@ -37,7 +37,7 @@ type UploadLogRepo interface {
 	FindDistinctPendingTaskCodes(ctx context.Context) ([]string, error)
 	FindPendingByCode(ctx context.Context, taskCode string, maxRetry, limit int) ([]UploadLog, error)
 	MarkUploaded(ctx context.Context, id int64) error
-	IncrRetry(ctx context.Context, id int64, errMsg string) error
+	MarkRetryOrFailed(ctx context.Context, id int64, maxRetry int, errMsg string) error
 	GetLastTimeEndByCode(ctx context.Context, taskCode string) (time.Time, bool, error)
 }
 
@@ -51,10 +51,10 @@ type BigTaskRepo interface {
 	SumBatchRecords(ctx context.Context, instanceID int64) (int, error)
 	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]BigTaskBatch, error)
 	MarkBatchUploaded(ctx context.Context, batchID int64) error
-	IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error
+	MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error
 	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
 	UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error
-	MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error
+	FinalizeInstance(ctx context.Context, instanceID int64, finishedAt time.Time) error
 }
 
 // BizTaskRepo provides business-trigger task persistence.
@@ -67,10 +67,10 @@ type BizTaskRepo interface {
 	SumBatchRecords(ctx context.Context, instanceID int64) (int, error)
 	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]BizTaskBatch, error)
 	MarkBatchUploaded(ctx context.Context, batchID int64) error
-	IncrBatchRetry(ctx context.Context, batchID int64, errMsg string) error
+	MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error
 	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
 	UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error
-	MarkInstanceCompleted(ctx context.Context, instanceID int64, finishedAt time.Time) error
+	FinalizeInstance(ctx context.Context, instanceID int64, finishedAt time.Time) error
 }
 
 // UploadFailureStrategy controls behavior when single batch upload fails.
