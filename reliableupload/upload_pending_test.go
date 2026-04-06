@@ -2,6 +2,8 @@ package reliableupload
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -320,5 +322,43 @@ func TestUploadPendingBigBatches_CallsUploadHooks(t *testing.T) {
 	}
 	if hooks.beforeCount != 1 || hooks.afterCount != 1 || hooks.errorCount != 0 {
 		t.Fatalf("unexpected hook calls before=%d after=%d error=%d", hooks.beforeCount, hooks.afterCount, hooks.errorCount)
+	}
+}
+
+func TestUploadMinuteByTaskCode_ReturnsStatusUpdateErrorWhenMarkRetryFails(t *testing.T) {
+	ctx := context.Background()
+	cfg := TaskConfig{TaskCode: "minute_demo", MaxRetry: 1}
+
+	logRepo := newFakeUploadLogRepo(cfg.TaskCode, 1)
+	logRepo.markRetryErr = errors.New("mark retry failed")
+	backup := &fakeBackupStore{data: map[string][]byte{}}
+	reporter := &fakeReporter{}
+
+	reg := NewRegistry()
+	reg.RegisterReporter(cfg.TaskCode, reporter)
+
+	engine := NewEngine(reg, nil, logRepo, nil, nil, backup)
+	err := engine.uploadMinuteByTaskCode(ctx, cfg)
+	if err == nil || !strings.Contains(err.Error(), "mark retry failed") {
+		t.Fatalf("expected mark retry error, got %v", err)
+	}
+}
+
+func TestUploadPendingBigBatches_ReturnsStatusUpdateErrorWhenMarkRetryFails(t *testing.T) {
+	ctx := context.Background()
+	cfg := TaskConfig{TaskCode: "big_demo", MaxRetry: 3}
+
+	repo := newFakeBigRepo("big_demo", 1, 1)
+	repo.markRetryErr = errors.New("mark batch retry failed")
+	backup := &fakeBackupStore{data: map[string][]byte{"p1": []byte("data-1")}}
+	reporter := &fakeReporter{failOnFile: map[string]struct{}{"big_demo_001.dat": {}}}
+
+	reg := NewRegistry()
+	reg.RegisterReporter(cfg.TaskCode, reporter)
+
+	engine := NewEngine(reg, nil, nil, repo, nil, backup)
+	err := engine.uploadPendingBigBatches(ctx, cfg, 1)
+	if err == nil || !strings.Contains(err.Error(), "mark batch retry failed") {
+		t.Fatalf("expected mark retry error, got %v", err)
 	}
 }

@@ -324,17 +324,23 @@ func (e *Engine) uploadMinuteByTaskCode(ctx context.Context, cfg TaskConfig) err
 	for _, log := range logs {
 		data, err := e.backup.Read(ctx, log.BackupPath)
 		if err != nil {
-			_ = e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error())
+			if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error()); markErr != nil {
+				return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+			}
 			return err
 		}
 		meta, err := decodeMeta(log.MetaJSON)
 		if err != nil {
-			_ = e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error())
+			if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error()); markErr != nil {
+				return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+			}
 			return err
 		}
 		item := UploadItem{FileName: log.FileName, Data: data, BizKey: log.BizKey, Meta: meta, BackupPath: log.BackupPath}
 		if err := rp.Upload(ctx, cfg, item); err != nil {
-			_ = e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error())
+			if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error()); markErr != nil {
+				return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+			}
 			return err
 		}
 		if err := e.logRepo.MarkUploaded(ctx, log.ID); err != nil {
@@ -527,8 +533,8 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 			}
 			return toUploadBatchRecordsFromBig(batches), nil
 		},
-		markRetryOrFailed: func(batchID int64, errMsg string) {
-			_ = e.bigRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
+		markRetryOrFailed: func(batchID int64, errMsg string) error {
+			return e.bigRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
 		},
 		markUploaded: func(batchID int64) error {
 			return e.bigRepo.MarkBatchUploaded(ctx, batchID)
@@ -568,8 +574,8 @@ func (e *Engine) uploadPendingBizBatches(ctx context.Context, cfg TaskConfig, in
 			}
 			return toUploadBatchRecordsFromBiz(batches), nil
 		},
-		markRetryOrFailed: func(batchID int64, errMsg string) {
-			_ = e.bizRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
+		markRetryOrFailed: func(batchID int64, errMsg string) error {
+			return e.bizRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
 		},
 		markUploaded: func(batchID int64) error {
 			return e.bizRepo.MarkBatchUploaded(ctx, batchID)
@@ -594,7 +600,7 @@ type uploadBatchRecord struct {
 type uploadBatchOptions struct {
 	countUploaded     func() (int, error)
 	findPending       func(limit int) ([]uploadBatchRecord, error)
-	markRetryOrFailed func(batchID int64, errMsg string)
+	markRetryOrFailed func(batchID int64, errMsg string) error
 	markUploaded      func(batchID int64) error
 	updateUploaded    func(uploaded int) error
 	finalize          func(finishedAt time.Time) error
@@ -641,7 +647,9 @@ func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, opts 
 	errs := make([]string, 0)
 
 	handleBatchErr := func(batch uploadBatchRecord, item UploadItem, err error) error {
-		opts.markRetryOrFailed(batch.ID, err.Error())
+		if markErr := opts.markRetryOrFailed(batch.ID, err.Error()); markErr != nil {
+			return fmt.Errorf("batch=%d upload error: %v; mark retry status failed: %w", batch.ID, err, markErr)
+		}
 		e.hooks.OnUploadError(ctx, cfg, item, err)
 		if finalizeErr := opts.finalize(e.clock.Now()); finalizeErr != nil {
 			return finalizeErr

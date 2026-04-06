@@ -12,6 +12,8 @@ import (
 type fakeUploadLogRepo struct {
 	mu   sync.Mutex
 	logs []UploadLog
+	// Injects persistence failure for retry-status updates.
+	markRetryErr error
 }
 
 func newFakeUploadLogRepo(taskCode string, total int) *fakeUploadLogRepo {
@@ -86,6 +88,9 @@ func (r *fakeUploadLogRepo) MarkUploaded(_ context.Context, id int64) error {
 func (r *fakeUploadLogRepo) MarkRetryOrFailed(_ context.Context, id int64, maxRetry int, errMsg string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.markRetryErr != nil {
+		return r.markRetryErr
+	}
 	for i := range r.logs {
 		if r.logs[i].ID == id {
 			r.logs[i].RetryCount++
@@ -123,6 +128,8 @@ type fakeBigRepo struct {
 	instance      BigTaskInstance
 	completed     bool
 	failed        bool
+	// Injects persistence failure for retry-status updates.
+	markRetryErr error
 }
 
 func newFakeBigRepo(taskCode string, instanceID int64, total int) *fakeBigRepo {
@@ -207,6 +214,9 @@ func (r *fakeBigRepo) MarkBatchUploaded(_ context.Context, batchID int64) error 
 func (r *fakeBigRepo) MarkBatchRetryOrFailed(_ context.Context, batchID int64, maxRetry int, errMsg string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.markRetryErr != nil {
+		return r.markRetryErr
+	}
 	for i := range r.batches {
 		if r.batches[i].ID == batchID {
 			r.batches[i].RetryCount++
@@ -314,6 +324,8 @@ type fakeBizRepo struct {
 	instance      BizTaskInstance
 	completed     bool
 	failed        bool
+	// Injects persistence failure for retry-status updates.
+	markRetryErr error
 }
 
 func newFakeBizRepo(taskCode string, instanceID int64, total int) *fakeBizRepo {
@@ -398,6 +410,9 @@ func (r *fakeBizRepo) MarkBatchUploaded(_ context.Context, batchID int64) error 
 func (r *fakeBizRepo) MarkBatchRetryOrFailed(_ context.Context, batchID int64, maxRetry int, errMsg string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.markRetryErr != nil {
+		return r.markRetryErr
+	}
 	for i := range r.batches {
 		if r.batches[i].ID == batchID {
 			r.batches[i].RetryCount++
