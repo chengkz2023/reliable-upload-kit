@@ -48,6 +48,13 @@ trigger, ok := reliableupload.BizTriggerFromContext(ctx)
 
 并在实例表上建立唯一键 `(task_code, trigger_key)`，实现触发幂等。
 
+生产侧并发幂等建议：
+- `UploadLogRepo.Create`
+- `BigTaskRepo.CreateBatch`
+- `BizTaskRepo.CreateBatch`
+
+当遇到唯一键冲突时，Repo 实现应返回 `reliableupload.ErrAlreadyExists`（可 wrap）。引擎会将其视为并发下的幂等冲突并继续执行。
+
 ## 4. MySQL/GORM 示例
 
 可参考：

@@ -3,6 +3,7 @@ package reliableupload
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -307,7 +308,13 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
-		return e.logRepo.Create(ctx, log)
+		if err := e.logRepo.Create(ctx, log); err != nil {
+			if isAlreadyExistsErr(err) {
+				return nil
+			}
+			return err
+		}
+		return nil
 	}
 	for index := 1; index <= total; index++ {
 		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
@@ -337,6 +344,9 @@ func (e *Engine) produceRange(ctx context.Context, cfg TaskConfig, start, end ti
 			UpdatedAt:  now,
 		}
 		if err := e.logRepo.Create(ctx, log); err != nil {
+			if isAlreadyExistsErr(err) {
+				continue
+			}
 			return err
 		}
 	}
@@ -465,11 +475,6 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 	if err != nil {
 		return err
 	}
-	existingRecords, err := e.bigRepo.SumBatchRecords(ctx, inst.ID)
-	if err != nil {
-		return err
-	}
-	newRecords := 0
 	for index := existingCount + 1; index <= total; index++ {
 		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
 		if err != nil {
@@ -501,11 +506,17 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 			UpdatedAt:   now,
 		}
 		if err := e.bigRepo.CreateBatch(ctx, batch); err != nil {
+			if isAlreadyExistsErr(err) {
+				continue
+			}
 			return err
 		}
-		newRecords += chunk.RecordCount
 	}
-	return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, total, existingRecords+newRecords)
+	latestRecords, err := e.bigRepo.SumBatchRecords(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	return e.bigRepo.UpdateProducedMeta(ctx, inst.ID, total, latestRecords)
 }
 
 func (e *Engine) produceBiz(ctx context.Context, cfg TaskConfig, inst BizTaskInstance) error {
@@ -530,11 +541,6 @@ func (e *Engine) produceBiz(ctx context.Context, cfg TaskConfig, inst BizTaskIns
 	if err != nil {
 		return err
 	}
-	existingRecords, err := e.bizRepo.SumBatchRecords(ctx, inst.ID)
-	if err != nil {
-		return err
-	}
-	newRecords := 0
 	for index := existingCount + 1; index <= total; index++ {
 		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
 		if err != nil {
@@ -568,11 +574,17 @@ func (e *Engine) produceBiz(ctx context.Context, cfg TaskConfig, inst BizTaskIns
 			UpdatedAt:   now,
 		}
 		if err := e.bizRepo.CreateBatch(ctx, batch); err != nil {
+			if isAlreadyExistsErr(err) {
+				continue
+			}
 			return err
 		}
-		newRecords += chunk.RecordCount
 	}
-	return e.bizRepo.UpdateProducedMeta(ctx, inst.ID, total, existingRecords+newRecords)
+	latestRecords, err := e.bizRepo.SumBatchRecords(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	return e.bizRepo.UpdateProducedMeta(ctx, inst.ID, total, latestRecords)
 }
 
 func (e *Engine) uploadBig(ctx context.Context) error {
@@ -1074,4 +1086,8 @@ func cloneMeta(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func isAlreadyExistsErr(err error) bool {
+	return errors.Is(err, ErrAlreadyExists)
 }

@@ -11,7 +11,8 @@ import (
 
 	"smart-upload/reliableupload"
 
-	"gorm.io/driver/mysql"
+	dmysql "github.com/go-sql-driver/mysql"
+	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -110,7 +111,7 @@ type bizTaskBatchModel struct {
 func (bizTaskBatchModel) TableName() string { return "biz_task_batch" }
 
 func openMySQL(dsn string) (*gorm.DB, error) {
-	return gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	return gorm.Open(gormmysql.Open(dsn), &gorm.Config{})
 }
 
 func ensureMySQLDatabase(dsn string) error {
@@ -194,7 +195,7 @@ func (r *mysqlUploadLogRepo) Create(ctx context.Context, log reliableupload.Uplo
 		CreatedAt:  log.CreatedAt,
 		UpdatedAt:  log.UpdatedAt,
 	}
-	return r.db.WithContext(ctx).Create(&m).Error
+	return mapCreateErr(r.db.WithContext(ctx).Create(&m).Error)
 }
 
 func (r *mysqlUploadLogRepo) FindDistinctPendingTaskCodes(ctx context.Context) ([]string, error) {
@@ -396,7 +397,7 @@ func (r *mysqlBigRepo) CreateBatch(ctx context.Context, batch reliableupload.Big
 		CreatedAt:   batch.CreatedAt,
 		UpdatedAt:   batch.UpdatedAt,
 	}
-	return r.db.WithContext(ctx).Create(&m).Error
+	return mapCreateErr(r.db.WithContext(ctx).Create(&m).Error)
 }
 
 func (r *mysqlBigRepo) FindRunningInstances(ctx context.Context) ([]reliableupload.BigTaskInstance, error) {
@@ -653,7 +654,7 @@ func (r *mysqlBizRepo) CreateBatch(ctx context.Context, batch reliableupload.Biz
 		CreatedAt:   batch.CreatedAt,
 		UpdatedAt:   batch.UpdatedAt,
 	}
-	return r.db.WithContext(ctx).Create(&m).Error
+	return mapCreateErr(r.db.WithContext(ctx).Create(&m).Error)
 }
 
 func (r *mysqlBizRepo) FindRunningInstances(ctx context.Context) ([]reliableupload.BizTaskInstance, error) {
@@ -882,6 +883,17 @@ var claimIDSeq atomic.Uint64
 
 func buildClaimID(workerID string) string {
 	return fmt.Sprintf("%s-%d-%d", workerID, time.Now().UnixNano(), claimIDSeq.Add(1))
+}
+
+func mapCreateErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var mysqlErr *dmysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+		return fmt.Errorf("%w: %v", reliableupload.ErrAlreadyExists, err)
+	}
+	return err
 }
 
 func toBigInstance(m bigTaskInstanceModel) reliableupload.BigTaskInstance {
