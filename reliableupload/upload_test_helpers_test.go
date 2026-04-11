@@ -12,6 +12,7 @@ import (
 type fakeUploadLogRepo struct {
 	mu   sync.Mutex
 	logs []UploadLog
+	seq  int
 	// Injects persistence failure for retry-status updates.
 	markRetryErr error
 }
@@ -57,47 +58,68 @@ func (r *fakeUploadLogRepo) FindDistinctPendingTaskCodes(_ context.Context) ([]s
 	return codes, nil
 }
 
-func (r *fakeUploadLogRepo) FindPendingByCode(_ context.Context, taskCode string, maxRetry, limit int) ([]UploadLog, error) {
+func (r *fakeUploadLogRepo) ClaimPendingByCode(_ context.Context, taskCode string, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]UploadLog, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 	out := make([]UploadLog, 0, limit)
-	for _, log := range r.logs {
-		if log.TaskCode == taskCode && log.Status == StatusPending && log.RetryCount <= maxRetry {
-			out = append(out, log)
+	for i := range r.logs {
+		log := r.logs[i]
+		isPendingReady := log.Status == StatusPending && (log.LeaseUntil == nil || !log.LeaseUntil.After(now))
+		isRunningExpired := log.Status == StatusRunning && log.LeaseUntil != nil && !log.LeaseUntil.After(now)
+		if log.TaskCode == taskCode && log.RetryCount <= maxRetry && (isPendingReady || isRunningExpired) {
+			r.seq++
+			claimID := fmt.Sprintf("uplog-claim-%d", r.seq)
+			lease := leaseUntil
+			r.logs[i].Status = StatusRunning
+			r.logs[i].ClaimID = claimID
+			r.logs[i].Owner = workerID
+			r.logs[i].LeaseUntil = &lease
+			out = append(out, r.logs[i])
+			if len(out) >= limit {
+				break
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	if len(out) > limit {
-		out = out[:limit]
-	}
 	return out, nil
 }
 
-func (r *fakeUploadLogRepo) MarkUploaded(_ context.Context, id int64) error {
+func (r *fakeUploadLogRepo) MarkUploaded(_ context.Context, id int64, claimID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i := range r.logs {
-		if r.logs[i].ID == id {
+		if r.logs[i].ID == id && r.logs[i].ClaimID == claimID {
 			r.logs[i].Status = StatusUploaded
+			r.logs[i].ClaimID = ""
+			r.logs[i].Owner = ""
+			r.logs[i].LeaseUntil = nil
 			return nil
 		}
 	}
 	return fmt.Errorf("log not found: %d", id)
 }
 
-func (r *fakeUploadLogRepo) MarkRetryOrFailed(_ context.Context, id int64, maxRetry int, errMsg string) error {
+func (r *fakeUploadLogRepo) MarkRetryOrFailed(_ context.Context, id int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.markRetryErr != nil {
 		return r.markRetryErr
 	}
 	for i := range r.logs {
-		if r.logs[i].ID == id {
+		if r.logs[i].ID == id && r.logs[i].ClaimID == claimID {
 			r.logs[i].RetryCount++
 			r.logs[i].ErrMsg = errMsg
 			if r.logs[i].RetryCount > maxRetry {
 				r.logs[i].Status = StatusFailed
+				r.logs[i].LeaseUntil = nil
+			} else {
+				r.logs[i].Status = StatusPending
+				lease := nextVisibleAt
+				r.logs[i].LeaseUntil = &lease
 			}
+			r.logs[i].ClaimID = ""
+			r.logs[i].Owner = ""
 			return nil
 		}
 	}
@@ -124,6 +146,7 @@ type fakeBigRepo struct {
 
 	mu            sync.Mutex
 	batches       []BigTaskBatch
+	seq           int
 	uploadedTrace []int
 	instance      BigTaskInstance
 	completed     bool
@@ -182,48 +205,69 @@ func (r *fakeBigRepo) SumBatchRecords(context.Context, int64) (int, error) {
 	return 0, errors.New("not implemented")
 }
 
-func (r *fakeBigRepo) FindPendingBatches(_ context.Context, instanceID int64, maxRetry, limit int) ([]BigTaskBatch, error) {
+func (r *fakeBigRepo) ClaimPendingBatches(_ context.Context, instanceID int64, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]BigTaskBatch, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 
 	out := make([]BigTaskBatch, 0, limit)
-	for _, b := range r.batches {
-		if b.InstanceID == instanceID && b.Status == StatusPending && b.RetryCount <= maxRetry {
-			out = append(out, b)
+	for i := range r.batches {
+		b := r.batches[i]
+		isPendingReady := b.Status == StatusPending && (b.LeaseUntil == nil || !b.LeaseUntil.After(now))
+		isRunningExpired := b.Status == StatusRunning && b.LeaseUntil != nil && !b.LeaseUntil.After(now)
+		if b.InstanceID == instanceID && b.RetryCount <= maxRetry && (isPendingReady || isRunningExpired) {
+			r.seq++
+			claimID := fmt.Sprintf("big-claim-%d", r.seq)
+			lease := leaseUntil
+			r.batches[i].Status = StatusRunning
+			r.batches[i].ClaimID = claimID
+			r.batches[i].Owner = workerID
+			r.batches[i].LeaseUntil = &lease
+			out = append(out, r.batches[i])
+			if len(out) >= limit {
+				break
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].BatchIndex < out[j].BatchIndex })
-	if len(out) > limit {
-		out = out[:limit]
-	}
 	return out, nil
 }
 
-func (r *fakeBigRepo) MarkBatchUploaded(_ context.Context, batchID int64) error {
+func (r *fakeBigRepo) MarkBatchUploaded(_ context.Context, batchID int64, claimID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i := range r.batches {
-		if r.batches[i].ID == batchID {
+		if r.batches[i].ID == batchID && r.batches[i].ClaimID == claimID {
 			r.batches[i].Status = StatusUploaded
+			r.batches[i].ClaimID = ""
+			r.batches[i].Owner = ""
+			r.batches[i].LeaseUntil = nil
 			return nil
 		}
 	}
 	return fmt.Errorf("batch not found: %d", batchID)
 }
 
-func (r *fakeBigRepo) MarkBatchRetryOrFailed(_ context.Context, batchID int64, maxRetry int, errMsg string) error {
+func (r *fakeBigRepo) MarkBatchRetryOrFailed(_ context.Context, batchID int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.markRetryErr != nil {
 		return r.markRetryErr
 	}
 	for i := range r.batches {
-		if r.batches[i].ID == batchID {
+		if r.batches[i].ID == batchID && r.batches[i].ClaimID == claimID {
 			r.batches[i].RetryCount++
 			r.batches[i].ErrMsg = errMsg
 			if r.batches[i].RetryCount > maxRetry {
 				r.batches[i].Status = StatusFailed
+				r.batches[i].LeaseUntil = nil
+			} else {
+				r.batches[i].Status = StatusPending
+				lease := nextVisibleAt
+				r.batches[i].LeaseUntil = &lease
 			}
+			r.batches[i].ClaimID = ""
+			r.batches[i].Owner = ""
 			return nil
 		}
 	}
@@ -320,6 +364,7 @@ type fakeBizRepo struct {
 
 	mu            sync.Mutex
 	batches       []BizTaskBatch
+	seq           int
 	uploadedTrace []int
 	instance      BizTaskInstance
 	completed     bool
@@ -378,48 +423,69 @@ func (r *fakeBizRepo) SumBatchRecords(context.Context, int64) (int, error) {
 	return 0, errors.New("not implemented")
 }
 
-func (r *fakeBizRepo) FindPendingBatches(_ context.Context, instanceID int64, maxRetry, limit int) ([]BizTaskBatch, error) {
+func (r *fakeBizRepo) ClaimPendingBatches(_ context.Context, instanceID int64, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]BizTaskBatch, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 
 	out := make([]BizTaskBatch, 0, limit)
-	for _, b := range r.batches {
-		if b.InstanceID == instanceID && b.Status == StatusPending && b.RetryCount <= maxRetry {
-			out = append(out, b)
+	for i := range r.batches {
+		b := r.batches[i]
+		isPendingReady := b.Status == StatusPending && (b.LeaseUntil == nil || !b.LeaseUntil.After(now))
+		isRunningExpired := b.Status == StatusRunning && b.LeaseUntil != nil && !b.LeaseUntil.After(now)
+		if b.InstanceID == instanceID && b.RetryCount <= maxRetry && (isPendingReady || isRunningExpired) {
+			r.seq++
+			claimID := fmt.Sprintf("biz-claim-%d", r.seq)
+			lease := leaseUntil
+			r.batches[i].Status = StatusRunning
+			r.batches[i].ClaimID = claimID
+			r.batches[i].Owner = workerID
+			r.batches[i].LeaseUntil = &lease
+			out = append(out, r.batches[i])
+			if len(out) >= limit {
+				break
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].BatchIndex < out[j].BatchIndex })
-	if len(out) > limit {
-		out = out[:limit]
-	}
 	return out, nil
 }
 
-func (r *fakeBizRepo) MarkBatchUploaded(_ context.Context, batchID int64) error {
+func (r *fakeBizRepo) MarkBatchUploaded(_ context.Context, batchID int64, claimID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i := range r.batches {
-		if r.batches[i].ID == batchID {
+		if r.batches[i].ID == batchID && r.batches[i].ClaimID == claimID {
 			r.batches[i].Status = StatusUploaded
+			r.batches[i].ClaimID = ""
+			r.batches[i].Owner = ""
+			r.batches[i].LeaseUntil = nil
 			return nil
 		}
 	}
 	return fmt.Errorf("batch not found: %d", batchID)
 }
 
-func (r *fakeBizRepo) MarkBatchRetryOrFailed(_ context.Context, batchID int64, maxRetry int, errMsg string) error {
+func (r *fakeBizRepo) MarkBatchRetryOrFailed(_ context.Context, batchID int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.markRetryErr != nil {
 		return r.markRetryErr
 	}
 	for i := range r.batches {
-		if r.batches[i].ID == batchID {
+		if r.batches[i].ID == batchID && r.batches[i].ClaimID == claimID {
 			r.batches[i].RetryCount++
 			r.batches[i].ErrMsg = errMsg
 			if r.batches[i].RetryCount > maxRetry {
 				r.batches[i].Status = StatusFailed
+				r.batches[i].LeaseUntil = nil
+			} else {
+				r.batches[i].Status = StatusPending
+				lease := nextVisibleAt
+				r.batches[i].LeaseUntil = &lease
 			}
+			r.batches[i].ClaimID = ""
+			r.batches[i].Owner = ""
 			return nil
 		}
 	}

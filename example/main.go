@@ -11,11 +11,12 @@ import (
 	"smart-upload/reliableupload"
 )
 
-const defaultDSN = "root:chengkangze.1@tcp(139.196.105.27:3306)/smart_upload?charset=utf8mb4&parseTime=True&loc=Local"
-
 func main() {
 	ctx := context.Background()
-	dsn := envOrDefault("MYSQL_DSN", defaultDSN)
+	dsn := os.Getenv("MYSQL_DSN")
+	if dsn == "" {
+		panic("MYSQL_DSN is required")
+	}
 
 	if err := ensureMySQLDatabase(dsn); err != nil {
 		panic(fmt.Sprintf("ensure mysql database failed: %v", err))
@@ -104,13 +105,6 @@ func main() {
 	for _, name := range rp.UploadedFiles() {
 		fmt.Println(" -", name)
 	}
-}
-
-func envOrDefault(key, defaultValue string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultValue
 }
 
 type demoDataSource struct{}

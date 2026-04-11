@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -360,5 +361,69 @@ func TestUploadPendingBigBatches_ReturnsStatusUpdateErrorWhenMarkRetryFails(t *t
 	err := engine.uploadPendingBigBatches(ctx, cfg, 1)
 	if err == nil || !strings.Contains(err.Error(), "mark batch retry failed") {
 		t.Fatalf("expected mark retry error, got %v", err)
+	}
+}
+
+func TestUploadMinuteByTaskCode_DoesNotDuplicateUploadAcrossWorkers(t *testing.T) {
+	ctx := context.Background()
+	cfg := TaskConfig{TaskCode: "minute_demo", MaxRetry: 3}
+
+	logRepo := newFakeUploadLogRepo(cfg.TaskCode, 1)
+	backup := &fakeBackupStore{data: map[string][]byte{"lp1": []byte("payload")}}
+	reporter := &fakeReporter{}
+
+	reg := NewRegistry()
+	reg.RegisterReporter(cfg.TaskCode, reporter)
+
+	engine1 := NewEngine(reg, nil, logRepo, nil, nil, backup, WithWorkerID("worker-1"))
+	engine2 := NewEngine(reg, nil, logRepo, nil, nil, backup, WithWorkerID("worker-2"))
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errCh <- engine1.uploadMinuteByTaskCode(ctx, cfg)
+	}()
+	go func() {
+		defer wg.Done()
+		errCh <- engine2.uploadMinuteByTaskCode(ctx, cfg)
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("unexpected upload error: %v", err)
+		}
+	}
+
+	if got := reporter.uploadedCount(); got != 1 {
+		t.Fatalf("expected exactly one upload across workers, got %d", got)
+	}
+	log := logRepo.logByID(1)
+	if log.Status != StatusUploaded {
+		t.Fatalf("expected final status uploaded, got %v", log.Status)
+	}
+}
+
+func TestUploadMinuteByTaskCode_CallsUploadHooks(t *testing.T) {
+	ctx := context.Background()
+	cfg := TaskConfig{TaskCode: "minute_demo", MaxRetry: 3}
+
+	logRepo := newFakeUploadLogRepo(cfg.TaskCode, 1)
+	backup := &fakeBackupStore{data: map[string][]byte{"lp1": []byte("payload")}}
+	reporter := &fakeReporter{}
+	hooks := &recordingHooks{}
+
+	reg := NewRegistry()
+	reg.RegisterReporter(cfg.TaskCode, reporter)
+
+	engine := NewEngine(reg, nil, logRepo, nil, nil, backup, WithUploadHooks(hooks))
+	if err := engine.uploadMinuteByTaskCode(ctx, cfg); err != nil {
+		t.Fatalf("uploadMinuteByTaskCode returned error: %v", err)
+	}
+
+	if hooks.beforeCount != 1 || hooks.afterCount != 1 || hooks.errorCount != 0 {
+		t.Fatalf("unexpected hook calls before=%d after=%d error=%d", hooks.beforeCount, hooks.afterCount, hooks.errorCount)
 	}
 }

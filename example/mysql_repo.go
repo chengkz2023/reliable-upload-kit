@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"smart-upload/reliableupload"
@@ -16,19 +17,22 @@ import (
 )
 
 type uploadLogModel struct {
-	ID         int64     `gorm:"column:id;primaryKey;autoIncrement"`
-	TaskCode   string    `gorm:"column:task_code;type:varchar(64);not null;index:idx_scan,priority:1"`
-	TimeStart  time.Time `gorm:"column:time_start;not null;index:idx_scan,priority:3"`
-	TimeEnd    time.Time `gorm:"column:time_end;not null"`
-	FileName   string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
-	BizKey     string    `gorm:"column:biz_key;type:varchar(128)"`
-	MetaJSON   string    `gorm:"column:meta_json;type:text"`
-	Status     uint8     `gorm:"column:status;not null;default:0;index:idx_scan,priority:2"`
-	BackupPath string    `gorm:"column:backup_path;type:varchar(512)"`
-	RetryCount int       `gorm:"column:retry_count;not null;default:0"`
-	ErrMsg     string    `gorm:"column:err_msg;type:varchar(1024)"`
-	CreatedAt  time.Time `gorm:"column:created_at;autoCreateTime"`
-	UpdatedAt  time.Time `gorm:"column:updated_at;autoUpdateTime"`
+	ID         int64      `gorm:"column:id;primaryKey;autoIncrement"`
+	TaskCode   string     `gorm:"column:task_code;type:varchar(64);not null;index:idx_scan,priority:1"`
+	TimeStart  time.Time  `gorm:"column:time_start;not null;index:idx_scan,priority:3"`
+	TimeEnd    time.Time  `gorm:"column:time_end;not null"`
+	FileName   string     `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
+	BizKey     string     `gorm:"column:biz_key;type:varchar(128)"`
+	MetaJSON   string     `gorm:"column:meta_json;type:text"`
+	ClaimID    string     `gorm:"column:claim_id;type:varchar(64);index:idx_claim_scan,priority:5"`
+	Owner      string     `gorm:"column:owner;type:varchar(64);index:idx_claim_scan,priority:6"`
+	LeaseUntil *time.Time `gorm:"column:lease_until;index:idx_claim_scan,priority:4"`
+	Status     uint8      `gorm:"column:status;not null;default:0;index:idx_scan,priority:2"`
+	BackupPath string     `gorm:"column:backup_path;type:varchar(512)"`
+	RetryCount int        `gorm:"column:retry_count;not null;default:0"`
+	ErrMsg     string     `gorm:"column:err_msg;type:varchar(1024)"`
+	CreatedAt  time.Time  `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt  time.Time  `gorm:"column:updated_at;autoUpdateTime"`
 }
 
 func (uploadLogModel) TableName() string { return "uploadlog" }
@@ -49,19 +53,22 @@ type bigTaskInstanceModel struct {
 func (bigTaskInstanceModel) TableName() string { return "big_task_instance" }
 
 type bigTaskBatchModel struct {
-	ID          int64     `gorm:"column:id;primaryKey;autoIncrement"`
-	InstanceID  int64     `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
-	BatchIndex  int       `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
-	FileName    string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
-	RecordCount int       `gorm:"column:record_count;not null;default:0"`
-	BizKey      string    `gorm:"column:biz_key;type:varchar(128)"`
-	MetaJSON    string    `gorm:"column:meta_json;type:text"`
-	BackupPath  string    `gorm:"column:backup_path;type:varchar(512)"`
-	Status      uint8     `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
-	RetryCount  int       `gorm:"column:retry_count;not null;default:0"`
-	ErrMsg      string    `gorm:"column:err_msg;type:varchar(1024)"`
-	CreatedAt   time.Time `gorm:"column:created_at;autoCreateTime"`
-	UpdatedAt   time.Time `gorm:"column:updated_at;autoUpdateTime"`
+	ID          int64      `gorm:"column:id;primaryKey;autoIncrement"`
+	InstanceID  int64      `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
+	BatchIndex  int        `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
+	FileName    string     `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
+	RecordCount int        `gorm:"column:record_count;not null;default:0"`
+	BizKey      string     `gorm:"column:biz_key;type:varchar(128)"`
+	MetaJSON    string     `gorm:"column:meta_json;type:text"`
+	ClaimID     string     `gorm:"column:claim_id;type:varchar(64);index:idx_instance_claim,priority:5"`
+	Owner       string     `gorm:"column:owner;type:varchar(64);index:idx_instance_claim,priority:6"`
+	LeaseUntil  *time.Time `gorm:"column:lease_until;index:idx_instance_claim,priority:4"`
+	BackupPath  string     `gorm:"column:backup_path;type:varchar(512)"`
+	Status      uint8      `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
+	RetryCount  int        `gorm:"column:retry_count;not null;default:0"`
+	ErrMsg      string     `gorm:"column:err_msg;type:varchar(1024)"`
+	CreatedAt   time.Time  `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt   time.Time  `gorm:"column:updated_at;autoUpdateTime"`
 }
 
 func (bigTaskBatchModel) TableName() string { return "big_task_batch" }
@@ -82,19 +89,22 @@ type bizTaskInstanceModel struct {
 func (bizTaskInstanceModel) TableName() string { return "biz_task_instance" }
 
 type bizTaskBatchModel struct {
-	ID          int64     `gorm:"column:id;primaryKey;autoIncrement"`
-	InstanceID  int64     `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
-	BatchIndex  int       `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
-	FileName    string    `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
-	RecordCount int       `gorm:"column:record_count;not null;default:0"`
-	BizKey      string    `gorm:"column:biz_key;type:varchar(128)"`
-	MetaJSON    string    `gorm:"column:meta_json;type:text"`
-	BackupPath  string    `gorm:"column:backup_path;type:varchar(512)"`
-	Status      uint8     `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
-	RetryCount  int       `gorm:"column:retry_count;not null;default:0"`
-	ErrMsg      string    `gorm:"column:err_msg;type:varchar(1024)"`
-	CreatedAt   time.Time `gorm:"column:created_at;autoCreateTime"`
-	UpdatedAt   time.Time `gorm:"column:updated_at;autoUpdateTime"`
+	ID          int64      `gorm:"column:id;primaryKey;autoIncrement"`
+	InstanceID  int64      `gorm:"column:instance_id;not null;uniqueIndex:uk_instance_batch,priority:1;index:idx_instance_status,priority:1"`
+	BatchIndex  int        `gorm:"column:batch_index;not null;uniqueIndex:uk_instance_batch,priority:2;index:idx_instance_status,priority:3"`
+	FileName    string     `gorm:"column:file_name;type:varchar(255);not null;uniqueIndex:uk_file_name"`
+	RecordCount int        `gorm:"column:record_count;not null;default:0"`
+	BizKey      string     `gorm:"column:biz_key;type:varchar(128)"`
+	MetaJSON    string     `gorm:"column:meta_json;type:text"`
+	ClaimID     string     `gorm:"column:claim_id;type:varchar(64);index:idx_instance_claim,priority:5"`
+	Owner       string     `gorm:"column:owner;type:varchar(64);index:idx_instance_claim,priority:6"`
+	LeaseUntil  *time.Time `gorm:"column:lease_until;index:idx_instance_claim,priority:4"`
+	BackupPath  string     `gorm:"column:backup_path;type:varchar(512)"`
+	Status      uint8      `gorm:"column:status;not null;default:0;index:idx_instance_status,priority:2"`
+	RetryCount  int        `gorm:"column:retry_count;not null;default:0"`
+	ErrMsg      string     `gorm:"column:err_msg;type:varchar(1024)"`
+	CreatedAt   time.Time  `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt   time.Time  `gorm:"column:updated_at;autoUpdateTime"`
 }
 
 func (bizTaskBatchModel) TableName() string { return "biz_task_batch" }
@@ -174,6 +184,9 @@ func (r *mysqlUploadLogRepo) Create(ctx context.Context, log reliableupload.Uplo
 		FileName:   log.FileName,
 		BizKey:     log.BizKey,
 		MetaJSON:   log.MetaJSON,
+		ClaimID:    log.ClaimID,
+		Owner:      log.Owner,
+		LeaseUntil: log.LeaseUntil,
 		Status:     uint8(log.Status),
 		BackupPath: log.BackupPath,
 		RetryCount: log.RetryCount,
@@ -195,19 +208,51 @@ func (r *mysqlUploadLogRepo) FindDistinctPendingTaskCodes(ctx context.Context) (
 	return codes, err
 }
 
-func (r *mysqlUploadLogRepo) FindPendingByCode(ctx context.Context, taskCode string, maxRetry, limit int) ([]reliableupload.UploadLog, error) {
-	var rows []uploadLogModel
-	err := r.db.WithContext(ctx).
-		Model(&uploadLogModel{}).
-		Where("task_code = ? AND status = ? AND retry_count <= ?", taskCode, uint8(reliableupload.StatusPending), maxRetry).
-		Order("time_start ASC, id ASC").
-		Limit(limit).
-		Find(&rows).Error
+func (r *mysqlUploadLogRepo) ClaimPendingByCode(ctx context.Context, taskCode string, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]reliableupload.UploadLog, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	claimID := buildClaimID(workerID)
+	now := time.Now()
+	pending := uint8(reliableupload.StatusPending)
+	running := uint8(reliableupload.StatusRunning)
+	claimed := make([]uploadLogModel, 0, limit)
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Exec(
+			`UPDATE uploadlog
+			 SET status = ?, owner = ?, claim_id = ?, lease_until = ?, updated_at = ?
+			 WHERE task_code = ?
+			   AND retry_count <= ?
+			   AND (
+			     (status = ? AND (lease_until IS NULL OR lease_until <= ?))
+			     OR (status = ? AND lease_until <= ?)
+			   )
+			 ORDER BY time_start ASC, id ASC
+			 LIMIT ?`,
+			running, workerID, claimID, leaseUntil, now,
+			taskCode, maxRetry,
+			pending, now,
+			running, now,
+			limit,
+		)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		return tx.
+			Model(&uploadLogModel{}).
+			Where("claim_id = ? AND owner = ? AND status = ?", claimID, workerID, running).
+			Order("time_start ASC, id ASC").
+			Find(&claimed).Error
+	})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]reliableupload.UploadLog, 0, len(rows))
-	for _, row := range rows {
+	out := make([]reliableupload.UploadLog, 0, len(claimed))
+	for _, row := range claimed {
 		out = append(out, reliableupload.UploadLog{
 			ID:         row.ID,
 			TaskCode:   row.TaskCode,
@@ -216,6 +261,9 @@ func (r *mysqlUploadLogRepo) FindPendingByCode(ctx context.Context, taskCode str
 			FileName:   row.FileName,
 			BizKey:     row.BizKey,
 			MetaJSON:   row.MetaJSON,
+			ClaimID:    row.ClaimID,
+			Owner:      row.Owner,
+			LeaseUntil: row.LeaseUntil,
 			Status:     reliableupload.Status(row.Status),
 			BackupPath: row.BackupPath,
 			RetryCount: row.RetryCount,
@@ -227,27 +275,50 @@ func (r *mysqlUploadLogRepo) FindPendingByCode(ctx context.Context, taskCode str
 	return out, nil
 }
 
-func (r *mysqlUploadLogRepo) MarkUploaded(ctx context.Context, id int64) error {
-	return r.db.WithContext(ctx).
+func (r *mysqlUploadLogRepo) MarkUploaded(ctx context.Context, id int64, claimID string) error {
+	now := time.Now()
+	res := r.db.WithContext(ctx).
 		Model(&uploadLogModel{}).
-		Where("id = ?", id).
-		Updates(map[string]any{"status": uint8(reliableupload.StatusUploaded), "updated_at": time.Now()}).
-		Error
+		Where("id = ? AND claim_id = ? AND status = ?", id, claimID, uint8(reliableupload.StatusRunning)).
+		Updates(map[string]any{
+			"status":      uint8(reliableupload.StatusUploaded),
+			"claim_id":    "",
+			"owner":       "",
+			"lease_until": nil,
+			"updated_at":  now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("claim lost before marking uploaded: uploadlog id=%d claim_id=%s", id, claimID)
+	}
+	return nil
 }
 
-func (r *mysqlUploadLogRepo) MarkRetryOrFailed(ctx context.Context, id int64, maxRetry int, errMsg string) error {
+func (r *mysqlUploadLogRepo) MarkRetryOrFailed(ctx context.Context, id int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error {
 	failed := uint8(reliableupload.StatusFailed)
 	pending := uint8(reliableupload.StatusPending)
-	return r.db.WithContext(ctx).
+	now := time.Now()
+	res := r.db.WithContext(ctx).
 		Model(&uploadLogModel{}).
-		Where("id = ?", id).
+		Where("id = ? AND claim_id = ? AND status = ?", id, claimID, uint8(reliableupload.StatusRunning)).
 		Updates(map[string]any{
 			"retry_count": gorm.Expr("retry_count + 1"),
 			"err_msg":     errMsg,
 			"status":      gorm.Expr("CASE WHEN retry_count + 1 > ? THEN ? ELSE ? END", maxRetry, failed, pending),
-			"updated_at":  time.Now(),
-		}).
-		Error
+			"lease_until": gorm.Expr("CASE WHEN retry_count + 1 > ? THEN NULL ELSE ? END", maxRetry, nextVisibleAt),
+			"claim_id":    "",
+			"owner":       "",
+			"updated_at":  now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("claim lost before marking retry/failed: uploadlog id=%d claim_id=%s", id, claimID)
+	}
+	return nil
 }
 
 func (r *mysqlUploadLogRepo) GetLastTimeEndByCode(ctx context.Context, taskCode string) (time.Time, bool, error) {
@@ -315,6 +386,9 @@ func (r *mysqlBigRepo) CreateBatch(ctx context.Context, batch reliableupload.Big
 		RecordCount: batch.RecordCount,
 		BizKey:      batch.BizKey,
 		MetaJSON:    batch.MetaJSON,
+		ClaimID:     batch.ClaimID,
+		Owner:       batch.Owner,
+		LeaseUntil:  batch.LeaseUntil,
 		BackupPath:  batch.BackupPath,
 		Status:      uint8(batch.Status),
 		RetryCount:  batch.RetryCount,
@@ -365,19 +439,52 @@ func (r *mysqlBigRepo) SumBatchRecords(ctx context.Context, instanceID int64) (i
 	return int(total.Int64), nil
 }
 
-func (r *mysqlBigRepo) FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]reliableupload.BigTaskBatch, error) {
-	var rows []bigTaskBatchModel
-	err := r.db.WithContext(ctx).
-		Model(&bigTaskBatchModel{}).
-		Where("instance_id = ? AND status = ? AND retry_count <= ?", instanceID, uint8(reliableupload.StatusPending), maxRetry).
-		Order("batch_index ASC").
-		Limit(limit).
-		Find(&rows).Error
+func (r *mysqlBigRepo) ClaimPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]reliableupload.BigTaskBatch, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	claimID := buildClaimID(workerID)
+	now := time.Now()
+	pending := uint8(reliableupload.StatusPending)
+	running := uint8(reliableupload.StatusRunning)
+	claimed := make([]bigTaskBatchModel, 0, limit)
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Exec(
+			`UPDATE big_task_batch
+			 SET status = ?, owner = ?, claim_id = ?, lease_until = ?, updated_at = ?
+			 WHERE instance_id = ?
+			   AND retry_count <= ?
+			   AND (
+			     (status = ? AND (lease_until IS NULL OR lease_until <= ?))
+			     OR (status = ? AND lease_until <= ?)
+			   )
+			 ORDER BY batch_index ASC, id ASC
+			 LIMIT ?`,
+			running, workerID, claimID, leaseUntil, now,
+			instanceID, maxRetry,
+			pending, now,
+			running, now,
+			limit,
+		)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		return tx.
+			Model(&bigTaskBatchModel{}).
+			Where("claim_id = ? AND owner = ? AND status = ?", claimID, workerID, running).
+			Order("batch_index ASC, id ASC").
+			Find(&claimed).Error
+	})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]reliableupload.BigTaskBatch, 0, len(rows))
-	for _, row := range rows {
+
+	out := make([]reliableupload.BigTaskBatch, 0, len(claimed))
+	for _, row := range claimed {
 		out = append(out, reliableupload.BigTaskBatch{
 			ID:          row.ID,
 			InstanceID:  row.InstanceID,
@@ -386,6 +493,9 @@ func (r *mysqlBigRepo) FindPendingBatches(ctx context.Context, instanceID int64,
 			RecordCount: row.RecordCount,
 			BizKey:      row.BizKey,
 			MetaJSON:    row.MetaJSON,
+			ClaimID:     row.ClaimID,
+			Owner:       row.Owner,
+			LeaseUntil:  row.LeaseUntil,
 			BackupPath:  row.BackupPath,
 			Status:      reliableupload.Status(row.Status),
 			RetryCount:  row.RetryCount,
@@ -397,27 +507,50 @@ func (r *mysqlBigRepo) FindPendingBatches(ctx context.Context, instanceID int64,
 	return out, nil
 }
 
-func (r *mysqlBigRepo) MarkBatchUploaded(ctx context.Context, batchID int64) error {
-	return r.db.WithContext(ctx).
+func (r *mysqlBigRepo) MarkBatchUploaded(ctx context.Context, batchID int64, claimID string) error {
+	now := time.Now()
+	res := r.db.WithContext(ctx).
 		Model(&bigTaskBatchModel{}).
-		Where("id = ?", batchID).
-		Updates(map[string]any{"status": uint8(reliableupload.StatusUploaded), "updated_at": time.Now()}).
-		Error
+		Where("id = ? AND claim_id = ? AND status = ?", batchID, claimID, uint8(reliableupload.StatusRunning)).
+		Updates(map[string]any{
+			"status":      uint8(reliableupload.StatusUploaded),
+			"claim_id":    "",
+			"owner":       "",
+			"lease_until": nil,
+			"updated_at":  now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("claim lost before marking uploaded: big_task_batch id=%d claim_id=%s", batchID, claimID)
+	}
+	return nil
 }
 
-func (r *mysqlBigRepo) MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error {
+func (r *mysqlBigRepo) MarkBatchRetryOrFailed(ctx context.Context, batchID int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error {
 	failed := uint8(reliableupload.StatusFailed)
 	pending := uint8(reliableupload.StatusPending)
-	return r.db.WithContext(ctx).
+	now := time.Now()
+	res := r.db.WithContext(ctx).
 		Model(&bigTaskBatchModel{}).
-		Where("id = ?", batchID).
+		Where("id = ? AND claim_id = ? AND status = ?", batchID, claimID, uint8(reliableupload.StatusRunning)).
 		Updates(map[string]any{
 			"retry_count": gorm.Expr("retry_count + 1"),
 			"err_msg":     errMsg,
 			"status":      gorm.Expr("CASE WHEN retry_count + 1 > ? THEN ? ELSE ? END", maxRetry, failed, pending),
-			"updated_at":  time.Now(),
-		}).
-		Error
+			"lease_until": gorm.Expr("CASE WHEN retry_count + 1 > ? THEN NULL ELSE ? END", maxRetry, nextVisibleAt),
+			"claim_id":    "",
+			"owner":       "",
+			"updated_at":  now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("claim lost before marking retry/failed: big_task_batch id=%d claim_id=%s", batchID, claimID)
+	}
+	return nil
 }
 
 func (r *mysqlBigRepo) CountUploadedBatches(ctx context.Context, instanceID int64) (int, error) {
@@ -510,6 +643,9 @@ func (r *mysqlBizRepo) CreateBatch(ctx context.Context, batch reliableupload.Biz
 		RecordCount: batch.RecordCount,
 		BizKey:      batch.BizKey,
 		MetaJSON:    batch.MetaJSON,
+		ClaimID:     batch.ClaimID,
+		Owner:       batch.Owner,
+		LeaseUntil:  batch.LeaseUntil,
 		BackupPath:  batch.BackupPath,
 		Status:      uint8(batch.Status),
 		RetryCount:  batch.RetryCount,
@@ -560,19 +696,52 @@ func (r *mysqlBizRepo) SumBatchRecords(ctx context.Context, instanceID int64) (i
 	return int(total.Int64), nil
 }
 
-func (r *mysqlBizRepo) FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]reliableupload.BizTaskBatch, error) {
-	var rows []bizTaskBatchModel
-	err := r.db.WithContext(ctx).
-		Model(&bizTaskBatchModel{}).
-		Where("instance_id = ? AND status = ? AND retry_count <= ?", instanceID, uint8(reliableupload.StatusPending), maxRetry).
-		Order("batch_index ASC").
-		Limit(limit).
-		Find(&rows).Error
+func (r *mysqlBizRepo) ClaimPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]reliableupload.BizTaskBatch, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	claimID := buildClaimID(workerID)
+	now := time.Now()
+	pending := uint8(reliableupload.StatusPending)
+	running := uint8(reliableupload.StatusRunning)
+	claimed := make([]bizTaskBatchModel, 0, limit)
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Exec(
+			`UPDATE biz_task_batch
+			 SET status = ?, owner = ?, claim_id = ?, lease_until = ?, updated_at = ?
+			 WHERE instance_id = ?
+			   AND retry_count <= ?
+			   AND (
+			     (status = ? AND (lease_until IS NULL OR lease_until <= ?))
+			     OR (status = ? AND lease_until <= ?)
+			   )
+			 ORDER BY batch_index ASC, id ASC
+			 LIMIT ?`,
+			running, workerID, claimID, leaseUntil, now,
+			instanceID, maxRetry,
+			pending, now,
+			running, now,
+			limit,
+		)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		return tx.
+			Model(&bizTaskBatchModel{}).
+			Where("claim_id = ? AND owner = ? AND status = ?", claimID, workerID, running).
+			Order("batch_index ASC, id ASC").
+			Find(&claimed).Error
+	})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]reliableupload.BizTaskBatch, 0, len(rows))
-	for _, row := range rows {
+
+	out := make([]reliableupload.BizTaskBatch, 0, len(claimed))
+	for _, row := range claimed {
 		out = append(out, reliableupload.BizTaskBatch{
 			ID:          row.ID,
 			InstanceID:  row.InstanceID,
@@ -581,6 +750,9 @@ func (r *mysqlBizRepo) FindPendingBatches(ctx context.Context, instanceID int64,
 			RecordCount: row.RecordCount,
 			BizKey:      row.BizKey,
 			MetaJSON:    row.MetaJSON,
+			ClaimID:     row.ClaimID,
+			Owner:       row.Owner,
+			LeaseUntil:  row.LeaseUntil,
 			BackupPath:  row.BackupPath,
 			Status:      reliableupload.Status(row.Status),
 			RetryCount:  row.RetryCount,
@@ -592,27 +764,50 @@ func (r *mysqlBizRepo) FindPendingBatches(ctx context.Context, instanceID int64,
 	return out, nil
 }
 
-func (r *mysqlBizRepo) MarkBatchUploaded(ctx context.Context, batchID int64) error {
-	return r.db.WithContext(ctx).
+func (r *mysqlBizRepo) MarkBatchUploaded(ctx context.Context, batchID int64, claimID string) error {
+	now := time.Now()
+	res := r.db.WithContext(ctx).
 		Model(&bizTaskBatchModel{}).
-		Where("id = ?", batchID).
-		Updates(map[string]any{"status": uint8(reliableupload.StatusUploaded), "updated_at": time.Now()}).
-		Error
+		Where("id = ? AND claim_id = ? AND status = ?", batchID, claimID, uint8(reliableupload.StatusRunning)).
+		Updates(map[string]any{
+			"status":      uint8(reliableupload.StatusUploaded),
+			"claim_id":    "",
+			"owner":       "",
+			"lease_until": nil,
+			"updated_at":  now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("claim lost before marking uploaded: biz_task_batch id=%d claim_id=%s", batchID, claimID)
+	}
+	return nil
 }
 
-func (r *mysqlBizRepo) MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error {
+func (r *mysqlBizRepo) MarkBatchRetryOrFailed(ctx context.Context, batchID int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error {
 	failed := uint8(reliableupload.StatusFailed)
 	pending := uint8(reliableupload.StatusPending)
-	return r.db.WithContext(ctx).
+	now := time.Now()
+	res := r.db.WithContext(ctx).
 		Model(&bizTaskBatchModel{}).
-		Where("id = ?", batchID).
+		Where("id = ? AND claim_id = ? AND status = ?", batchID, claimID, uint8(reliableupload.StatusRunning)).
 		Updates(map[string]any{
 			"retry_count": gorm.Expr("retry_count + 1"),
 			"err_msg":     errMsg,
 			"status":      gorm.Expr("CASE WHEN retry_count + 1 > ? THEN ? ELSE ? END", maxRetry, failed, pending),
-			"updated_at":  time.Now(),
-		}).
-		Error
+			"lease_until": gorm.Expr("CASE WHEN retry_count + 1 > ? THEN NULL ELSE ? END", maxRetry, nextVisibleAt),
+			"claim_id":    "",
+			"owner":       "",
+			"updated_at":  now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("claim lost before marking retry/failed: biz_task_batch id=%d claim_id=%s", batchID, claimID)
+	}
+	return nil
 }
 
 func (r *mysqlBizRepo) CountUploadedBatches(ctx context.Context, instanceID int64) (int, error) {
@@ -681,6 +876,12 @@ func batchCounts(ctx context.Context, db *gorm.DB, instanceID int64, model any) 
 		}
 	}
 	return total, uploaded, failed, nil
+}
+
+var claimIDSeq atomic.Uint64
+
+func buildClaimID(workerID string) string {
+	return fmt.Sprintf("%s-%d-%d", workerID, time.Now().UnixNano(), claimIDSeq.Add(1))
 }
 
 func toBigInstance(m bigTaskInstanceModel) reliableupload.BigTaskInstance {

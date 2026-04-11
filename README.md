@@ -26,15 +26,16 @@
 
 ```bash
 go mod tidy
-go run ./example
 ```
 
-可通过环境变量覆盖 DSN：
+先设置 MySQL DSN：
 
 ```powershell
 $env:MYSQL_DSN = "root:password@tcp(127.0.0.1:3306)/smart_upload?charset=utf8mb4&parseTime=True&loc=Local"
 go run ./example
 ```
+
+`example/main.go` 不再内置默认 DSN，未设置 `MYSQL_DSN` 会直接退出。
 
 ## 核心接口
 

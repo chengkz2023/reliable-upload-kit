@@ -18,7 +18,7 @@ const (
 	StatusPending  Status = 0
 	StatusUploaded Status = 1
 	StatusFailed   Status = 2
-	StatusRunning  Status = 3 // big/biz task instance only
+	StatusRunning  Status = 3 // task instance running or uploader-claimed batch/log
 )
 
 // TaskConfig is runtime configuration loaded from repository.
@@ -71,6 +71,9 @@ type UploadLog struct {
 	FileName   string
 	BizKey     string
 	MetaJSON   string
+	ClaimID    string
+	Owner      string
+	LeaseUntil *time.Time
 	Status     Status
 	BackupPath string
 	RetryCount int
@@ -102,6 +105,9 @@ type BigTaskBatch struct {
 	RecordCount int
 	BizKey      string
 	MetaJSON    string
+	ClaimID     string
+	Owner       string
+	LeaseUntil  *time.Time
 	BackupPath  string
 	Status      Status
 	RetryCount  int
@@ -139,6 +145,9 @@ type BizTaskBatch struct {
 	RecordCount int
 	BizKey      string
 	MetaJSON    string
+	ClaimID     string
+	Owner       string
+	LeaseUntil  *time.Time
 	BackupPath  string
 	Status      Status
 	RetryCount  int

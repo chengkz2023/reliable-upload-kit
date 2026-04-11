@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const defaultScanLimit = 1000
+const defaultClaimLease = 2 * time.Minute
 
 // Engine orchestrates producer/uploader/recovery flows.
 type Engine struct {
@@ -27,6 +31,12 @@ type Engine struct {
 	hooks        UploadHooks
 	failureMode  UploadFailureStrategy
 	pendingLimit int
+	workerID     string
+	claimLease   time.Duration
+	maxParallel  int
+	// startupBackfillLimit limits missing minute windows produced per task in one startup recovery run.
+	// 0 means unlimited.
+	startupBackfillLimit int
 }
 
 // EngineOption customizes engine behavior.
@@ -74,6 +84,39 @@ func WithUploadFailureStrategy(mode UploadFailureStrategy) EngineOption {
 		}
 	}
 }
+
+func WithWorkerID(workerID string) EngineOption {
+	return func(e *Engine) {
+		if strings.TrimSpace(workerID) != "" {
+			e.workerID = workerID
+		}
+	}
+}
+
+func WithClaimLease(d time.Duration) EngineOption {
+	return func(e *Engine) {
+		if d > 0 {
+			e.claimLease = d
+		}
+	}
+}
+
+func WithMaxParallel(n int) EngineOption {
+	return func(e *Engine) {
+		if n > 0 {
+			e.maxParallel = n
+		}
+	}
+}
+
+func WithStartupBackfillLimit(limit int) EngineOption {
+	return func(e *Engine) {
+		if limit > 0 {
+			e.startupBackfillLimit = limit
+		}
+	}
+}
+
 func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo, bigRepo BigTaskRepo, bizRepo BizTaskRepo, backup BackupStore, opts ...EngineOption) *Engine {
 	e := &Engine{
 		registry:     registry,
@@ -88,6 +131,9 @@ func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo
 		hooks:        noopUploadHooks{},
 		failureMode:  UploadFailureFailFast,
 		pendingLimit: defaultScanLimit,
+		workerID:     defaultWorkerID(),
+		claimLease:   defaultClaimLease,
+		maxParallel:  0,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -317,37 +363,56 @@ func (e *Engine) uploadMinuteByTaskCode(ctx context.Context, cfg TaskConfig) err
 	if err != nil {
 		return err
 	}
-	logs, err := e.logRepo.FindPendingByCode(ctx, cfg.TaskCode, cfg.MaxRetry, e.pendingLimit)
-	if err != nil {
-		return err
-	}
-	for _, log := range logs {
-		data, err := e.backup.Read(ctx, log.BackupPath)
+	for {
+		nextVisibleAt := e.clock.Now().Add(e.claimLease)
+		logs, err := e.logRepo.ClaimPendingByCode(ctx, cfg.TaskCode, cfg.MaxRetry, e.pendingLimit, e.workerID, nextVisibleAt)
 		if err != nil {
-			if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error()); markErr != nil {
-				return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
-			}
 			return err
 		}
-		meta, err := decodeMeta(log.MetaJSON)
-		if err != nil {
-			if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error()); markErr != nil {
-				return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
-			}
-			return err
+		if len(logs) == 0 {
+			return nil
 		}
-		item := UploadItem{FileName: log.FileName, Data: data, BizKey: log.BizKey, Meta: meta, BackupPath: log.BackupPath}
-		if err := rp.Upload(ctx, cfg, item); err != nil {
-			if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, cfg.MaxRetry, err.Error()); markErr != nil {
-				return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+		for _, log := range logs {
+			data, err := e.backup.Read(ctx, log.BackupPath)
+			if err != nil {
+				item := UploadItem{FileName: log.FileName, BackupPath: log.BackupPath, BizKey: log.BizKey}
+				if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, log.ClaimID, cfg.MaxRetry, err.Error(), nextVisibleAt); markErr != nil {
+					return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+				}
+				e.hooks.OnUploadError(ctx, cfg, item, err)
+				return err
 			}
-			return err
-		}
-		if err := e.logRepo.MarkUploaded(ctx, log.ID); err != nil {
-			return err
+			meta, err := decodeMeta(log.MetaJSON)
+			if err != nil {
+				item := UploadItem{FileName: log.FileName, BackupPath: log.BackupPath, BizKey: log.BizKey}
+				if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, log.ClaimID, cfg.MaxRetry, err.Error(), nextVisibleAt); markErr != nil {
+					return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+				}
+				e.hooks.OnUploadError(ctx, cfg, item, err)
+				return err
+			}
+			item := UploadItem{FileName: log.FileName, Data: data, BizKey: log.BizKey, Meta: meta, BackupPath: log.BackupPath}
+			uploadCtx, uploadItem, err := e.hooks.BeforeUpload(ctx, cfg, item)
+			if err != nil {
+				if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, log.ClaimID, cfg.MaxRetry, err.Error(), nextVisibleAt); markErr != nil {
+					return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+				}
+				e.hooks.OnUploadError(ctx, cfg, item, err)
+				return err
+			}
+			if err := rp.Upload(uploadCtx, cfg, uploadItem); err != nil {
+				if markErr := e.logRepo.MarkRetryOrFailed(ctx, log.ID, log.ClaimID, cfg.MaxRetry, err.Error(), nextVisibleAt); markErr != nil {
+					return fmt.Errorf("%v; mark retry status failed: %w", err, markErr)
+				}
+				e.hooks.OnUploadError(uploadCtx, cfg, uploadItem, err)
+				return err
+			}
+			if err := e.logRepo.MarkUploaded(ctx, log.ID, log.ClaimID); err != nil {
+				return err
+			}
+			e.hooks.AfterUpload(uploadCtx, cfg, uploadItem)
 		}
 	}
-	return nil
 }
 
 func (e *Engine) recoverMinuteGaps(ctx context.Context, cfg TaskConfig) error {
@@ -361,7 +426,12 @@ func (e *Engine) recoverMinuteGaps(ctx context.Context, cfg TaskConfig) error {
 	}
 	cutoffStart, _ := calcMinuteRange(e.clock.Now(), cfg.DelaySeconds, cfg.IntervalMinutes)
 	step := minuteInterval(cfg.IntervalMinutes)
+	attempted := 0
 	for t := lastEnd; t.Before(cutoffStart); t = t.Add(step) {
+		if e.startupBackfillLimit > 0 && attempted >= e.startupBackfillLimit {
+			e.logger.Infof("startup backfill limit reached task=%s limit=%d", cfg.TaskCode, e.startupBackfillLimit)
+			break
+		}
 		start, end := t, t.Add(step)
 		exists, err := e.logRepo.ExistsByTaskAndTimeRange(ctx, cfg.TaskCode, start, end)
 		if err != nil {
@@ -370,6 +440,7 @@ func (e *Engine) recoverMinuteGaps(ctx context.Context, cfg TaskConfig) error {
 		if exists {
 			continue
 		}
+		attempted++
 		if err := e.produceRange(ctx, cfg, start, end); err != nil {
 			e.logger.Errorf("backfill failed task=%s start=%s err=%v", cfg.TaskCode, start.Format(time.RFC3339), err)
 		}
@@ -526,18 +597,18 @@ func (e *Engine) uploadPendingBigBatches(ctx context.Context, cfg TaskConfig, in
 		countUploaded: func() (int, error) {
 			return e.bigRepo.CountUploadedBatches(ctx, instanceID)
 		},
-		findPending: func(limit int) ([]uploadBatchRecord, error) {
-			batches, err := e.bigRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, limit)
+		claimPending: func(limit int, leaseUntil time.Time) ([]uploadBatchRecord, error) {
+			batches, err := e.bigRepo.ClaimPendingBatches(ctx, instanceID, cfg.MaxRetry, limit, e.workerID, leaseUntil)
 			if err != nil {
 				return nil, err
 			}
 			return toUploadBatchRecordsFromBig(batches), nil
 		},
-		markRetryOrFailed: func(batchID int64, errMsg string) error {
-			return e.bigRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
+		markRetryOrFailed: func(batchID int64, claimID, errMsg string, nextVisibleAt time.Time) error {
+			return e.bigRepo.MarkBatchRetryOrFailed(ctx, batchID, claimID, cfg.MaxRetry, errMsg, nextVisibleAt)
 		},
-		markUploaded: func(batchID int64) error {
-			return e.bigRepo.MarkBatchUploaded(ctx, batchID)
+		markUploaded: func(batchID int64, claimID string) error {
+			return e.bigRepo.MarkBatchUploaded(ctx, batchID, claimID)
 		},
 		updateUploaded: func(uploaded int) error {
 			return e.bigRepo.UpdateUploadedBatches(ctx, instanceID, uploaded)
@@ -567,18 +638,18 @@ func (e *Engine) uploadPendingBizBatches(ctx context.Context, cfg TaskConfig, in
 		countUploaded: func() (int, error) {
 			return e.bizRepo.CountUploadedBatches(ctx, instanceID)
 		},
-		findPending: func(limit int) ([]uploadBatchRecord, error) {
-			batches, err := e.bizRepo.FindPendingBatches(ctx, instanceID, cfg.MaxRetry, limit)
+		claimPending: func(limit int, leaseUntil time.Time) ([]uploadBatchRecord, error) {
+			batches, err := e.bizRepo.ClaimPendingBatches(ctx, instanceID, cfg.MaxRetry, limit, e.workerID, leaseUntil)
 			if err != nil {
 				return nil, err
 			}
 			return toUploadBatchRecordsFromBiz(batches), nil
 		},
-		markRetryOrFailed: func(batchID int64, errMsg string) error {
-			return e.bizRepo.MarkBatchRetryOrFailed(ctx, batchID, cfg.MaxRetry, errMsg)
+		markRetryOrFailed: func(batchID int64, claimID, errMsg string, nextVisibleAt time.Time) error {
+			return e.bizRepo.MarkBatchRetryOrFailed(ctx, batchID, claimID, cfg.MaxRetry, errMsg, nextVisibleAt)
 		},
-		markUploaded: func(batchID int64) error {
-			return e.bizRepo.MarkBatchUploaded(ctx, batchID)
+		markUploaded: func(batchID int64, claimID string) error {
+			return e.bizRepo.MarkBatchUploaded(ctx, batchID, claimID)
 		},
 		updateUploaded: func(uploaded int) error {
 			return e.bizRepo.UpdateUploadedBatches(ctx, instanceID, uploaded)
@@ -594,14 +665,15 @@ type uploadBatchRecord struct {
 	FileName   string
 	BizKey     string
 	MetaJSON   string
+	ClaimID    string
 	BackupPath string
 }
 
 type uploadBatchOptions struct {
 	countUploaded     func() (int, error)
-	findPending       func(limit int) ([]uploadBatchRecord, error)
-	markRetryOrFailed func(batchID int64, errMsg string) error
-	markUploaded      func(batchID int64) error
+	claimPending      func(limit int, leaseUntil time.Time) ([]uploadBatchRecord, error)
+	markRetryOrFailed func(batchID int64, claimID, errMsg string, nextVisibleAt time.Time) error
+	markUploaded      func(batchID int64, claimID string) error
 	updateUploaded    func(uploaded int) error
 	finalize          func(finishedAt time.Time) error
 }
@@ -614,6 +686,7 @@ func toUploadBatchRecordsFromBig(in []BigTaskBatch) []uploadBatchRecord {
 			FileName:   batch.FileName,
 			BizKey:     batch.BizKey,
 			MetaJSON:   batch.MetaJSON,
+			ClaimID:    batch.ClaimID,
 			BackupPath: batch.BackupPath,
 		})
 	}
@@ -628,6 +701,7 @@ func toUploadBatchRecordsFromBiz(in []BizTaskBatch) []uploadBatchRecord {
 			FileName:   batch.FileName,
 			BizKey:     batch.BizKey,
 			MetaJSON:   batch.MetaJSON,
+			ClaimID:    batch.ClaimID,
 			BackupPath: batch.BackupPath,
 		})
 	}
@@ -647,7 +721,8 @@ func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, opts 
 	errs := make([]string, 0)
 
 	handleBatchErr := func(batch uploadBatchRecord, item UploadItem, err error) error {
-		if markErr := opts.markRetryOrFailed(batch.ID, err.Error()); markErr != nil {
+		nextVisibleAt := e.clock.Now().Add(e.claimLease)
+		if markErr := opts.markRetryOrFailed(batch.ID, batch.ClaimID, err.Error(), nextVisibleAt); markErr != nil {
 			return fmt.Errorf("batch=%d upload error: %v; mark retry status failed: %w", batch.ID, err, markErr)
 		}
 		e.hooks.OnUploadError(ctx, cfg, item, err)
@@ -666,7 +741,8 @@ func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, opts 
 		if e.failureMode == UploadFailureContinue {
 			queryLimit += len(attempted)
 		}
-		batches, err := opts.findPending(queryLimit)
+		leaseUntil := e.clock.Now().Add(e.claimLease)
+		batches, err := opts.claimPending(queryLimit, leaseUntil)
 		if err != nil {
 			return err
 		}
@@ -712,7 +788,7 @@ func (e *Engine) uploadPendingBatches(ctx context.Context, cfg TaskConfig, opts 
 				continue
 			}
 			e.hooks.AfterUpload(uploadCtx, cfg, uploadItem)
-			if err := opts.markUploaded(batch.ID); err != nil {
+			if err := opts.markUploaded(batch.ID, batch.ClaimID); err != nil {
 				return err
 			}
 			uploaded++
@@ -801,11 +877,14 @@ func minuteInterval(intervalMinutes int) time.Duration {
 func (e *Engine) runInParallel(configs []TaskConfig, fn func(cfg TaskConfig) error) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(configs))
+	sem := e.newParallelSemaphore()
 	for _, cfg := range configs {
 		cfg := cfg
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			e.acquireParallelSlot(sem)
+			defer e.releaseParallelSlot(sem)
 			if err := fn(cfg); err != nil {
 				errCh <- fmt.Errorf("task=%s: %w", cfg.TaskCode, err)
 			}
@@ -819,11 +898,14 @@ func (e *Engine) runInParallel(configs []TaskConfig, fn func(cfg TaskConfig) err
 func (e *Engine) runInParallelTaskCodes(codes []string, fn func(taskCode string) error) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(codes))
+	sem := e.newParallelSemaphore()
 	for _, code := range codes {
 		code := code
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			e.acquireParallelSlot(sem)
+			defer e.releaseParallelSlot(sem)
 			if err := fn(code); err != nil {
 				errCh <- fmt.Errorf("task=%s: %w", code, err)
 			}
@@ -837,11 +919,14 @@ func (e *Engine) runInParallelTaskCodes(codes []string, fn func(taskCode string)
 func (e *Engine) runInParallelInstances(instances []BigTaskInstance, fn func(inst BigTaskInstance) error) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(instances))
+	sem := e.newParallelSemaphore()
 	for _, inst := range instances {
 		inst := inst
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			e.acquireParallelSlot(sem)
+			defer e.releaseParallelSlot(sem)
 			if err := fn(inst); err != nil {
 				errCh <- fmt.Errorf("instance=%d: %w", inst.ID, err)
 			}
@@ -855,11 +940,14 @@ func (e *Engine) runInParallelInstances(instances []BigTaskInstance, fn func(ins
 func (e *Engine) runInParallelBizInstances(instances []BizTaskInstance, fn func(inst BizTaskInstance) error) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(instances))
+	sem := e.newParallelSemaphore()
 	for _, inst := range instances {
 		inst := inst
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			e.acquireParallelSlot(sem)
+			defer e.releaseParallelSlot(sem)
 			if err := fn(inst); err != nil {
 				errCh <- fmt.Errorf("biz_instance=%d: %w", inst.ID, err)
 			}
@@ -883,9 +971,44 @@ func joinErrors(errCh <-chan error) error {
 	return fmt.Errorf(strings.Join(msgs, " | "))
 }
 
+func (e *Engine) newParallelSemaphore() chan struct{} {
+	if e.maxParallel <= 0 {
+		return nil
+	}
+	return make(chan struct{}, e.maxParallel)
+}
+
+func (e *Engine) acquireParallelSlot(sem chan struct{}) {
+	if sem == nil {
+		return
+	}
+	sem <- struct{}{}
+}
+
+func (e *Engine) releaseParallelSlot(sem chan struct{}) {
+	if sem == nil {
+		return
+	}
+	<-sem
+}
+
 type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now() }
+
+var engineIDSeq atomic.Uint64
+
+func defaultWorkerID() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown-host"
+	}
+	return strings.Join([]string{
+		host,
+		"pid" + strconv.Itoa(os.Getpid()),
+		"e" + strconv.FormatUint(engineIDSeq.Add(1), 10),
+	}, "-")
+}
 
 type noopLogger struct{}
 

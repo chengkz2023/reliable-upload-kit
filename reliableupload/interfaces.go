@@ -35,9 +35,9 @@ type UploadLogRepo interface {
 	ExistsByTaskAndTimeRange(ctx context.Context, taskCode string, start, end time.Time) (bool, error)
 	Create(ctx context.Context, log UploadLog) error
 	FindDistinctPendingTaskCodes(ctx context.Context) ([]string, error)
-	FindPendingByCode(ctx context.Context, taskCode string, maxRetry, limit int) ([]UploadLog, error)
-	MarkUploaded(ctx context.Context, id int64) error
-	MarkRetryOrFailed(ctx context.Context, id int64, maxRetry int, errMsg string) error
+	ClaimPendingByCode(ctx context.Context, taskCode string, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]UploadLog, error)
+	MarkUploaded(ctx context.Context, id int64, claimID string) error
+	MarkRetryOrFailed(ctx context.Context, id int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error
 	GetLastTimeEndByCode(ctx context.Context, taskCode string) (time.Time, bool, error)
 }
 
@@ -49,9 +49,9 @@ type BigTaskRepo interface {
 	FindRunningInstances(ctx context.Context) ([]BigTaskInstance, error)
 	CountBatches(ctx context.Context, instanceID int64) (int, error)
 	SumBatchRecords(ctx context.Context, instanceID int64) (int, error)
-	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]BigTaskBatch, error)
-	MarkBatchUploaded(ctx context.Context, batchID int64) error
-	MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error
+	ClaimPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]BigTaskBatch, error)
+	MarkBatchUploaded(ctx context.Context, batchID int64, claimID string) error
+	MarkBatchRetryOrFailed(ctx context.Context, batchID int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error
 	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
 	UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error
 	FinalizeInstance(ctx context.Context, instanceID int64, finishedAt time.Time) error
@@ -65,9 +65,9 @@ type BizTaskRepo interface {
 	FindRunningInstances(ctx context.Context) ([]BizTaskInstance, error)
 	CountBatches(ctx context.Context, instanceID int64) (int, error)
 	SumBatchRecords(ctx context.Context, instanceID int64) (int, error)
-	FindPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int) ([]BizTaskBatch, error)
-	MarkBatchUploaded(ctx context.Context, batchID int64) error
-	MarkBatchRetryOrFailed(ctx context.Context, batchID int64, maxRetry int, errMsg string) error
+	ClaimPendingBatches(ctx context.Context, instanceID int64, maxRetry, limit int, workerID string, leaseUntil time.Time) ([]BizTaskBatch, error)
+	MarkBatchUploaded(ctx context.Context, batchID int64, claimID string) error
+	MarkBatchRetryOrFailed(ctx context.Context, batchID int64, claimID string, maxRetry int, errMsg string, nextVisibleAt time.Time) error
 	CountUploadedBatches(ctx context.Context, instanceID int64) (int, error)
 	UpdateUploadedBatches(ctx context.Context, instanceID int64, uploadedBatches int) error
 	FinalizeInstance(ctx context.Context, instanceID int64, finishedAt time.Time) error
