@@ -3,6 +3,7 @@ package reliableupload
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -72,6 +73,50 @@ func TestProduceBig_IgnoresAlreadyExistsBatchAndUsesLatestRecordSum(t *testing.T
 	}
 }
 
+func TestProduceBig_ProductionParallelismFetchesConcurrentlyAndCreatesInOrder(t *testing.T) {
+	ctx := context.Background()
+	cfg := TaskConfig{TaskCode: "big_demo", TaskType: TaskTypeBig, FilePrefix: "big_demo", ProductionParallelism: 3}
+	inst := BigTaskInstance{
+		ID:          1,
+		TaskCode:    cfg.TaskCode,
+		WindowStart: time.Date(2026, 4, 11, 9, 0, 0, 0, time.Local),
+		WindowEnd:   time.Date(2026, 4, 11, 10, 0, 0, 0, time.Local),
+	}
+
+	ds := newBlockingProductionDataSource(6)
+	reg := NewRegistry()
+	reg.RegisterDataSource(cfg.TaskCode, ds)
+	bigRepo := &recordingProduceBigRepo{}
+	engine := NewEngine(reg, nil, nil, bigRepo, nil, &noopBackupStore{})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.produceBig(ctx, cfg, inst)
+	}()
+
+	if !ds.waitForMaxConcurrent(3, time.Second) {
+		ds.releaseAll()
+		t.Fatalf("expected 3 concurrent fetches, got max %d", ds.maxConcurrent())
+	}
+	ds.releaseAll()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("produceBig returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("produceBig did not finish")
+	}
+
+	if got := bigRepo.createdIndices(); !equalInts(got, []int{1, 2, 3, 4, 5, 6}) {
+		t.Fatalf("expected ordered batch creation [1 2 3 4 5 6], got %v", got)
+	}
+	if bigRepo.updatedTotalBatches != 6 || bigRepo.updatedTotalRecords != 60 {
+		t.Fatalf("unexpected produced meta totalBatches=%d totalRecords=%d", bigRepo.updatedTotalBatches, bigRepo.updatedTotalRecords)
+	}
+}
+
 func TestProduceBiz_IgnoresAlreadyExistsBatchAndUsesLatestRecordSum(t *testing.T) {
 	ctx := context.Background()
 	cfg := TaskConfig{TaskCode: "biz_demo", TaskType: TaskTypeBiz, FilePrefix: "biz_demo"}
@@ -101,6 +146,119 @@ func TestProduceBiz_IgnoresAlreadyExistsBatchAndUsesLatestRecordSum(t *testing.T
 	if bizRepo.updatedTotalBatches != 1 || bizRepo.updatedTotalRecords != 50 {
 		t.Fatalf("unexpected produced meta totalBatches=%d totalRecords=%d", bizRepo.updatedTotalBatches, bizRepo.updatedTotalRecords)
 	}
+}
+
+type blockingProductionDataSource struct {
+	total   int
+	entered chan struct{}
+	release chan struct{}
+
+	mu       sync.Mutex
+	inFlight int
+	max      int
+	once     sync.Once
+}
+
+func newBlockingProductionDataSource(total int) *blockingProductionDataSource {
+	return &blockingProductionDataSource{
+		total:   total,
+		entered: make(chan struct{}, total),
+		release: make(chan struct{}),
+	}
+}
+
+func (d *blockingProductionDataSource) CountChunks(context.Context, TaskConfig, time.Time, time.Time) (int, error) {
+	return d.total, nil
+}
+
+func (d *blockingProductionDataSource) FetchChunk(context.Context, TaskConfig, time.Time, time.Time, int) (Chunk, error) {
+	d.mu.Lock()
+	d.inFlight++
+	if d.inFlight > d.max {
+		d.max = d.inFlight
+	}
+	d.mu.Unlock()
+
+	d.entered <- struct{}{}
+	<-d.release
+
+	d.mu.Lock()
+	d.inFlight--
+	d.mu.Unlock()
+	return Chunk{Data: []byte("payload"), RecordCount: 10}, nil
+}
+
+func (d *blockingProductionDataSource) waitForMaxConcurrent(target int, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		if d.maxConcurrent() >= target {
+			return true
+		}
+		select {
+		case <-d.entered:
+		case <-timer.C:
+			return false
+		}
+	}
+}
+
+func (d *blockingProductionDataSource) maxConcurrent() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.max
+}
+
+func (d *blockingProductionDataSource) releaseAll() {
+	d.once.Do(func() { close(d.release) })
+}
+
+type recordingProduceBigRepo struct {
+	idempotentBigRepo
+
+	mu                  sync.Mutex
+	batches             []BigTaskBatch
+	updatedTotalBatches int
+	updatedTotalRecords int
+}
+
+func (r *recordingProduceBigRepo) CountBatches(context.Context, int64) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.batches), nil
+}
+
+func (r *recordingProduceBigRepo) CreateBatch(_ context.Context, batch BigTaskBatch) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.batches = append(r.batches, batch)
+	return nil
+}
+
+func (r *recordingProduceBigRepo) SumBatchRecords(context.Context, int64) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	total := 0
+	for _, batch := range r.batches {
+		total += batch.RecordCount
+	}
+	return total, nil
+}
+
+func (r *recordingProduceBigRepo) UpdateProducedMeta(_ context.Context, _ int64, totalBatches, totalRecords int) error {
+	r.updatedTotalBatches = totalBatches
+	r.updatedTotalRecords = totalRecords
+	return nil
+}
+
+func (r *recordingProduceBigRepo) createdIndices() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]int, 0, len(r.batches))
+	for _, batch := range r.batches {
+		out = append(out, batch.BatchIndex)
+	}
+	return out
 }
 
 type fixedCountDataSource struct {

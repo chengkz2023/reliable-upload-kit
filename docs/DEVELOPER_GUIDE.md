@@ -39,6 +39,8 @@ trigger, ok := reliableupload.BizTriggerFromContext(ctx)
 - `RunBigTask(ctx, taskCode, start, end)`：创建/恢复一个大任务窗口
 - `RunBizTask(ctx, taskCode, triggerKey, triggerPayload)`：创建/恢复一个业务触发任务实例
 
+大任务/业务任务如果单实例数据量明显倾斜，可以通过 `TaskConfig.ProductionParallelism` 提高该任务的生产阶段并发度；未配置时继承 `WithProductionParallelism(n)` 的引擎默认值，默认值为 1。该能力只并发 `FetchChunk` 与备份文件写入，批次记录仍按 `batch_index` 顺序创建。
+
 ## 3. 幂等建议
 
 `RunBizTask` 建议使用稳定的业务键作为 `triggerKey`，例如：

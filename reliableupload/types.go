@@ -31,9 +31,12 @@ type TaskConfig struct {
 	DelaySeconds    int
 	BatchSize       int
 	MaxRetry        int
-	SFTPSubdir      string
-	FilePrefix      string
-	Enabled         bool
+	// ProductionParallelism overrides the engine default per big/biz task.
+	// 0 means inherit engine default.
+	ProductionParallelism int
+	SFTPSubdir            string
+	FilePrefix            string
+	Enabled               bool
 }
 
 // Chunk is one upload unit with optional business metadata.

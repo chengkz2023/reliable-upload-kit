@@ -11,6 +11,7 @@
 - 状态机驱动（`pending` / `uploaded` / `failed` / `running`）
 - 生产与上报解耦（Cron A / Cron B）
 - 按 `task_code` 隔离并发
+- 大任务/业务任务支持按任务配置单实例生产并发，缓解数据倾斜长尾
 - 启动恢复（分钟补窗 + 大任务/业务任务断点续传）
 - 按 `task_code` 自由触发生产/上报
 - 按 `task_code` 自定义文件命名

@@ -35,6 +35,9 @@ type Engine struct {
 	workerID     string
 	claimLease   time.Duration
 	maxParallel  int
+	// productionParallelism controls per-instance chunk production fan-out for big/biz tasks.
+	// It parallelizes FetchChunk + BackupStore.Save while preserving ordered batch creation.
+	productionParallelism int
 	// startupBackfillLimit limits missing minute windows produced per task in one startup recovery run.
 	// 0 means unlimited.
 	startupBackfillLimit int
@@ -110,6 +113,14 @@ func WithMaxParallel(n int) EngineOption {
 	}
 }
 
+func WithProductionParallelism(n int) EngineOption {
+	return func(e *Engine) {
+		if n > 0 {
+			e.productionParallelism = n
+		}
+	}
+}
+
 func WithStartupBackfillLimit(limit int) EngineOption {
 	return func(e *Engine) {
 		if limit > 0 {
@@ -120,21 +131,22 @@ func WithStartupBackfillLimit(limit int) EngineOption {
 
 func NewEngine(registry *Registry, cfgRepo TaskConfigRepo, logRepo UploadLogRepo, bigRepo BigTaskRepo, bizRepo BizTaskRepo, backup BackupStore, opts ...EngineOption) *Engine {
 	e := &Engine{
-		registry:     registry,
-		cfgRepo:      cfgRepo,
-		logRepo:      logRepo,
-		bigRepo:      bigRepo,
-		bizRepo:      bizRepo,
-		backup:       backup,
-		clock:        systemClock{},
-		logger:       noopLogger{},
-		namer:        defaultFileNamer{},
-		hooks:        noopUploadHooks{},
-		failureMode:  UploadFailureFailFast,
-		pendingLimit: defaultScanLimit,
-		workerID:     defaultWorkerID(),
-		claimLease:   defaultClaimLease,
-		maxParallel:  0,
+		registry:              registry,
+		cfgRepo:               cfgRepo,
+		logRepo:               logRepo,
+		bigRepo:               bigRepo,
+		bizRepo:               bizRepo,
+		backup:                backup,
+		clock:                 systemClock{},
+		logger:                noopLogger{},
+		namer:                 defaultFileNamer{},
+		hooks:                 noopUploadHooks{},
+		failureMode:           UploadFailureFailFast,
+		pendingLimit:          defaultScanLimit,
+		workerID:              defaultWorkerID(),
+		claimLease:            defaultClaimLease,
+		maxParallel:           0,
+		productionParallelism: 1,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -475,25 +487,25 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 	if err != nil {
 		return err
 	}
-	for index := existingCount + 1; index <= total; index++ {
+	if err := produceIndexedBatches(ctx, e.productionParallelismFor(cfg), existingCount+1, total, func(ctx context.Context, index int) (BigTaskBatch, error) {
 		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
 		if err != nil {
-			return err
+			return BigTaskBatch{}, err
 		}
 		if chunk.RecordCount < 0 {
-			return fmt.Errorf("task=%s invalid record count at batch=%d: %d", cfg.TaskCode, index, chunk.RecordCount)
+			return BigTaskBatch{}, fmt.Errorf("task=%s invalid record count at batch=%d: %d", cfg.TaskCode, index, chunk.RecordCount)
 		}
 		fileName := e.fileName(cfg, start, end, index, NameContext{BizKey: chunk.BizKey, Meta: chunk.Meta})
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
 		if err != nil {
-			return err
+			return BigTaskBatch{}, err
 		}
 		metaJSON, err := encodeMeta(chunk.Meta)
 		if err != nil {
-			return err
+			return BigTaskBatch{}, err
 		}
 		now := e.clock.Now()
-		batch := BigTaskBatch{
+		return BigTaskBatch{
 			InstanceID:  inst.ID,
 			BatchIndex:  index,
 			FileName:    fileName,
@@ -504,13 +516,17 @@ func (e *Engine) produceBig(ctx context.Context, cfg TaskConfig, inst BigTaskIns
 			Status:      StatusPending,
 			CreatedAt:   now,
 			UpdatedAt:   now,
-		}
+		}, nil
+	}, func(ctx context.Context, batch BigTaskBatch) error {
 		if err := e.bigRepo.CreateBatch(ctx, batch); err != nil {
 			if isAlreadyExistsErr(err) {
-				continue
+				return nil
 			}
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	latestRecords, err := e.bigRepo.SumBatchRecords(ctx, inst.ID)
 	if err != nil {
@@ -541,27 +557,27 @@ func (e *Engine) produceBiz(ctx context.Context, cfg TaskConfig, inst BizTaskIns
 	if err != nil {
 		return err
 	}
-	for index := existingCount + 1; index <= total; index++ {
+	if err := produceIndexedBatches(ctx, e.productionParallelismFor(cfg), existingCount+1, total, func(ctx context.Context, index int) (BizTaskBatch, error) {
 		chunk, err := ds.FetchChunk(ctx, cfg, start, end, index)
 		if err != nil {
-			return err
+			return BizTaskBatch{}, err
 		}
 		if chunk.RecordCount < 0 {
-			return fmt.Errorf("task=%s invalid record count at batch=%d: %d", cfg.TaskCode, index, chunk.RecordCount)
+			return BizTaskBatch{}, fmt.Errorf("task=%s invalid record count at batch=%d: %d", cfg.TaskCode, index, chunk.RecordCount)
 		}
 		nameMeta := cloneMeta(chunk.Meta)
 		nameMeta["trigger_key"] = inst.TriggerKey
 		fileName := e.fileName(cfg, start, end, index, NameContext{BizKey: chunk.BizKey, Meta: nameMeta})
 		backupPath, err := e.backup.Save(ctx, cfg.TaskCode, fileName, chunk.Data)
 		if err != nil {
-			return err
+			return BizTaskBatch{}, err
 		}
 		metaJSON, err := encodeMeta(chunk.Meta)
 		if err != nil {
-			return err
+			return BizTaskBatch{}, err
 		}
 		now := e.clock.Now()
-		batch := BizTaskBatch{
+		return BizTaskBatch{
 			InstanceID:  inst.ID,
 			BatchIndex:  index,
 			FileName:    fileName,
@@ -572,13 +588,17 @@ func (e *Engine) produceBiz(ctx context.Context, cfg TaskConfig, inst BizTaskIns
 			Status:      StatusPending,
 			CreatedAt:   now,
 			UpdatedAt:   now,
-		}
+		}, nil
+	}, func(ctx context.Context, batch BizTaskBatch) error {
 		if err := e.bizRepo.CreateBatch(ctx, batch); err != nil {
 			if isAlreadyExistsErr(err) {
-				continue
+				return nil
 			}
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	latestRecords, err := e.bizRepo.SumBatchRecords(ctx, inst.ID)
 	if err != nil {
@@ -968,6 +988,103 @@ func (e *Engine) runInParallelBizInstances(instances []BizTaskInstance, fn func(
 	wg.Wait()
 	close(errCh)
 	return joinErrors(errCh)
+}
+
+func (e *Engine) productionParallelismFor(cfg TaskConfig) int {
+	if cfg.ProductionParallelism > 0 {
+		return cfg.ProductionParallelism
+	}
+	return e.productionParallelism
+}
+
+type indexedProduceResult[T any] struct {
+	index int
+	value T
+	err   error
+}
+
+func produceIndexedBatches[T any](
+	ctx context.Context,
+	parallelism int,
+	startIndex int,
+	endIndex int,
+	build func(context.Context, int) (T, error),
+	create func(context.Context, T) error,
+) error {
+	if startIndex > endIndex {
+		return nil
+	}
+	if parallelism <= 1 {
+		for index := startIndex; index <= endIndex; index++ {
+			value, err := build(ctx, index)
+			if err != nil {
+				return fmt.Errorf("batch=%d: %w", index, err)
+			}
+			if err := create(ctx, value); err != nil {
+				return fmt.Errorf("batch=%d: %w", index, err)
+			}
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int)
+	results := make(chan indexedProduceResult[T], parallelism)
+	var wg sync.WaitGroup
+
+	workerCount := parallelism
+	total := endIndex - startIndex + 1
+	if workerCount > total {
+		workerCount = total
+	}
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				value, err := build(ctx, index)
+				results <- indexedProduceResult[T]{index: index, value: value, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		for index := startIndex; index <= endIndex; index++ {
+			jobs <- index
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	nextIndex := startIndex
+	pending := make(map[int]indexedProduceResult[T], workerCount)
+	var firstErr error
+
+	for result := range results {
+		pending[result.index] = result
+		for {
+			result, ok := pending[nextIndex]
+			if !ok {
+				break
+			}
+			delete(pending, nextIndex)
+
+			if firstErr == nil {
+				if result.err != nil {
+					firstErr = fmt.Errorf("batch=%d: %w", nextIndex, result.err)
+					cancel()
+				} else if err := create(ctx, result.value); err != nil {
+					firstErr = fmt.Errorf("batch=%d: %w", nextIndex, err)
+					cancel()
+				}
+			}
+			nextIndex++
+		}
+	}
+	return firstErr
 }
 
 func joinErrors(errCh <-chan error) error {
