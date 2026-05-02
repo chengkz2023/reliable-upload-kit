@@ -26,14 +26,16 @@
 ## 快速开始
 
 ```bash
-go mod tidy
+go get github.com/chengkz2023/reliable-upload-kit/reliableupload
 ```
 
 先设置 MySQL DSN：
 
 ```powershell
 $env:MYSQL_DSN = "root:password@tcp(127.0.0.1:3306)/smart_upload?charset=utf8mb4&parseTime=True&loc=Local"
-go run ./example
+cd example
+go mod tidy
+go run .
 ```
 
 `example/main.go` 不再内置默认 DSN，未设置 `MYSQL_DSN` 会直接退出。

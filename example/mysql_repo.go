@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"smart-upload/reliableupload"
+	"github.com/chengkz2023/reliable-upload-kit/reliableupload"
 
 	dmysql "github.com/go-sql-driver/mysql"
 	gormmysql "gorm.io/driver/mysql"

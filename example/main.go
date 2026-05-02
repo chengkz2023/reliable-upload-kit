@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"smart-upload/reliableupload"
+	"github.com/chengkz2023/reliable-upload-kit/reliableupload"
 )
 
 func main() {
