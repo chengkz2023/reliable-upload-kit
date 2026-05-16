@@ -17,6 +17,23 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+type taskConfigModel struct {
+	TaskCode              string    `gorm:"column:task_code;type:varchar(64);primaryKey"`
+	TaskType              uint8     `gorm:"column:task_type;not null;index:idx_enabled_type,priority:2"`
+	IntervalMinutes       int       `gorm:"column:interval_minutes;not null;default:0"`
+	DelaySeconds          int       `gorm:"column:delay_seconds;not null;default:0"`
+	BatchSize             int       `gorm:"column:batch_size;not null;default:0"`
+	MaxRetry              int       `gorm:"column:max_retry;not null;default:0"`
+	ProductionParallelism int       `gorm:"column:production_parallelism;not null;default:0"`
+	SFTPSubdir            string    `gorm:"column:sftp_subdir;type:varchar(255)"`
+	FilePrefix            string    `gorm:"column:file_prefix;type:varchar(128)"`
+	Enabled               bool      `gorm:"column:enabled;not null;default:true;index:idx_enabled_type,priority:1"`
+	CreatedAt             time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt             time.Time `gorm:"column:updated_at;autoUpdateTime"`
+}
+
+func (taskConfigModel) TableName() string { return "task_config" }
+
 type uploadLogModel struct {
 	ID         int64      `gorm:"column:id;primaryKey;autoIncrement"`
 	TaskCode   string     `gorm:"column:task_code;type:varchar(64);not null;index:idx_scan,priority:1"`
@@ -152,12 +169,90 @@ func splitMySQLDSN(dsn string) (adminDSN, dbName string, err error) {
 
 func initMySQLSchema(db *gorm.DB) error {
 	return db.AutoMigrate(
+		&taskConfigModel{},
 		&uploadLogModel{},
 		&bigTaskInstanceModel{},
 		&bigTaskBatchModel{},
 		&bizTaskInstanceModel{},
 		&bizTaskBatchModel{},
 	)
+}
+
+type mysqlTaskConfigRepo struct {
+	db *gorm.DB
+}
+
+func newMySQLTaskConfigRepo(db *gorm.DB) *mysqlTaskConfigRepo {
+	return &mysqlTaskConfigRepo{db: db}
+}
+
+func (r *mysqlTaskConfigRepo) FindAll(ctx context.Context) ([]reliableupload.TaskConfig, error) {
+	var rows []taskConfigModel
+	err := r.db.WithContext(ctx).
+		Order("task_code ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]reliableupload.TaskConfig, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, taskConfigFromModel(row))
+	}
+	return out, nil
+}
+
+func seedMySQLTaskConfigs(ctx context.Context, db *gorm.DB, configs []reliableupload.TaskConfig) error {
+	rows := make([]taskConfigModel, 0, len(configs))
+	for _, cfg := range configs {
+		rows = append(rows, taskConfigToModel(cfg))
+	}
+	return db.WithContext(ctx).
+		Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "task_code"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"task_type",
+				"interval_minutes",
+				"delay_seconds",
+				"batch_size",
+				"max_retry",
+				"production_parallelism",
+				"sftp_subdir",
+				"file_prefix",
+				"enabled",
+				"updated_at",
+			}),
+		}).
+		Create(&rows).Error
+}
+
+func (r *mysqlTaskConfigRepo) FindEnabledByType(ctx context.Context, typ reliableupload.TaskType) ([]reliableupload.TaskConfig, error) {
+	var rows []taskConfigModel
+	err := r.db.WithContext(ctx).
+		Where("enabled = ? AND task_type = ?", true, uint8(typ)).
+		Order("task_code ASC").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]reliableupload.TaskConfig, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, taskConfigFromModel(row))
+	}
+	return out, nil
+}
+
+func (r *mysqlTaskConfigRepo) Get(ctx context.Context, taskCode string) (reliableupload.TaskConfig, error) {
+	var row taskConfigModel
+	err := r.db.WithContext(ctx).
+		Where("task_code = ?", taskCode).
+		First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return reliableupload.TaskConfig{}, fmt.Errorf("task not found: %s", taskCode)
+	}
+	if err != nil {
+		return reliableupload.TaskConfig{}, err
+	}
+	return taskConfigFromModel(row), nil
 }
 
 type mysqlUploadLogRepo struct {
@@ -923,5 +1018,35 @@ func toBizInstance(m bizTaskInstanceModel) reliableupload.BizTaskInstance {
 		TotalRecords:    m.TotalRecords,
 		StartedAt:       m.StartedAt,
 		FinishedAt:      m.FinishedAt,
+	}
+}
+
+func taskConfigToModel(cfg reliableupload.TaskConfig) taskConfigModel {
+	return taskConfigModel{
+		TaskCode:              cfg.TaskCode,
+		TaskType:              uint8(cfg.TaskType),
+		IntervalMinutes:       cfg.IntervalMinutes,
+		DelaySeconds:          cfg.DelaySeconds,
+		BatchSize:             cfg.BatchSize,
+		MaxRetry:              cfg.MaxRetry,
+		ProductionParallelism: cfg.ProductionParallelism,
+		SFTPSubdir:            cfg.SFTPSubdir,
+		FilePrefix:            cfg.FilePrefix,
+		Enabled:               cfg.Enabled,
+	}
+}
+
+func taskConfigFromModel(m taskConfigModel) reliableupload.TaskConfig {
+	return reliableupload.TaskConfig{
+		TaskCode:              m.TaskCode,
+		TaskType:              reliableupload.TaskType(m.TaskType),
+		IntervalMinutes:       m.IntervalMinutes,
+		DelaySeconds:          m.DelaySeconds,
+		BatchSize:             m.BatchSize,
+		MaxRetry:              m.MaxRetry,
+		ProductionParallelism: m.ProductionParallelism,
+		SFTPSubdir:            m.SFTPSubdir,
+		FilePrefix:            m.FilePrefix,
+		Enabled:               m.Enabled,
 	}
 }

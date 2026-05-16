@@ -64,8 +64,11 @@ trigger, ok := reliableupload.BizTriggerFromContext(ctx)
 - [example/mysql_repo.go](../example/mysql_repo.go)
 
 示例表：
+- `task_config`
 - `uploadlog`
 - `big_task_instance`
 - `big_task_batch`
 - `biz_task_instance`
 - `biz_task_batch`
+
+真实项目通常建议启动时先从配置表加载一份内存快照，运行中按固定间隔刷新快照。这样可以避免每次生产/上传都查询配置表，同时允许 `task_config` 的开关、批大小、重试次数等配置修改在不重启服务的情况下生效。刷新失败时应继续使用上一份成功加载的配置。

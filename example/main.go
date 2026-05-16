@@ -40,8 +40,8 @@ func main() {
 	registry.RegisterDataSource("order_biz", ds)
 	registry.RegisterReporter("order_biz", rp)
 
-	cfgRepo := &memConfigRepo{m: map[string]reliableupload.TaskConfig{
-		"order_minute": {
+	configs := []reliableupload.TaskConfig{
+		{
 			TaskCode:        "order_minute",
 			TaskType:        reliableupload.TaskTypeMinute,
 			IntervalMinutes: 5,
@@ -52,7 +52,7 @@ func main() {
 			FilePrefix:      "order",
 			Enabled:         true,
 		},
-		"order_big": {
+		{
 			TaskCode:   "order_big",
 			TaskType:   reliableupload.TaskTypeBig,
 			BatchSize:  2000,
@@ -61,7 +61,7 @@ func main() {
 			FilePrefix: "order_big",
 			Enabled:    true,
 		},
-		"order_biz": {
+		{
 			TaskCode:   "order_biz",
 			TaskType:   reliableupload.TaskTypeBiz,
 			BatchSize:  2000,
@@ -70,7 +70,18 @@ func main() {
 			FilePrefix: "order_biz",
 			Enabled:    true,
 		},
-	}}
+	}
+	if err := seedMySQLTaskConfigs(ctx, db, configs); err != nil {
+		panic(fmt.Sprintf("seed mysql task configs failed: %v", err))
+	}
+	cfgRepo := newReloadableTaskConfigRepo(newMySQLTaskConfigRepo(db))
+	if err := cfgRepo.Load(ctx); err != nil {
+		panic(fmt.Sprintf("load task configs failed: %v", err))
+	}
+	stopReload := cfgRepo.StartAutoReload(ctx, time.Minute, func(err error) {
+		fmt.Printf("[config/reload/error] %v\n", err)
+	})
+	defer stopReload()
 
 	engine := reliableupload.NewEngine(
 		registry,
@@ -180,12 +191,61 @@ func (r *demoReporter) UploadedFiles() []string {
 	return out
 }
 
-type memConfigRepo struct {
-	m map[string]reliableupload.TaskConfig
+type taskConfigLoader interface {
+	FindAll(ctx context.Context) ([]reliableupload.TaskConfig, error)
 }
 
-func (r *memConfigRepo) FindEnabledByType(_ context.Context, typ reliableupload.TaskType) ([]reliableupload.TaskConfig, error) {
-	var out []reliableupload.TaskConfig
+type reloadableTaskConfigRepo struct {
+	loader taskConfigLoader
+	mu     sync.RWMutex
+	m      map[string]reliableupload.TaskConfig
+}
+
+func newReloadableTaskConfigRepo(loader taskConfigLoader) *reloadableTaskConfigRepo {
+	return &reloadableTaskConfigRepo{
+		loader: loader,
+		m:      map[string]reliableupload.TaskConfig{},
+	}
+}
+
+func (r *reloadableTaskConfigRepo) Load(ctx context.Context) error {
+	configs, err := r.loader.FindAll(ctx)
+	if err != nil {
+		return err
+	}
+	next := make(map[string]reliableupload.TaskConfig, len(configs))
+	for _, cfg := range configs {
+		next[cfg.TaskCode] = cfg
+	}
+	r.mu.Lock()
+	r.m = next
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *reloadableTaskConfigRepo) StartAutoReload(ctx context.Context, interval time.Duration, onErr func(error)) func() {
+	reloadCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := r.Load(reloadCtx); err != nil && onErr != nil {
+					onErr(err)
+				}
+			case <-reloadCtx.Done():
+				return
+			}
+		}
+	}()
+	return cancel
+}
+
+func (r *reloadableTaskConfigRepo) FindEnabledByType(_ context.Context, typ reliableupload.TaskType) ([]reliableupload.TaskConfig, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]reliableupload.TaskConfig, 0, len(r.m))
 	for _, cfg := range r.m {
 		if cfg.Enabled && cfg.TaskType == typ {
 			out = append(out, cfg)
@@ -195,7 +255,9 @@ func (r *memConfigRepo) FindEnabledByType(_ context.Context, typ reliableupload.
 	return out, nil
 }
 
-func (r *memConfigRepo) Get(_ context.Context, taskCode string) (reliableupload.TaskConfig, error) {
+func (r *reloadableTaskConfigRepo) Get(_ context.Context, taskCode string) (reliableupload.TaskConfig, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	cfg, ok := r.m[taskCode]
 	if !ok {
 		return reliableupload.TaskConfig{}, fmt.Errorf("task not found: %s", taskCode)

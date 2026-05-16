@@ -40,6 +40,8 @@ go run .
 
 `example/main.go` 不再内置默认 DSN，未设置 `MYSQL_DSN` 会直接退出。
 
+示例中的 `TaskConfigRepo` 会在启动时从 MySQL 加载配置到内存快照，并按固定间隔自动刷新；运行期间修改 `task_config` 表后，无需重启即可在下一次刷新后生效。
+
 ## 核心接口
 
 ```go
